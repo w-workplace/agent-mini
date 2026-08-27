@@ -14,9 +14,10 @@ an agent framework or a hosted code-execution service.
 from .agent import Agent, AgentError, MaxIterationsExceeded
 from .config import Config, load_config
 from .llm import LLMClient, LLMError
+from .store import SessionStore, StoreError
 from .tools import TOOL_SCHEMAS, ToolRunner
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "Agent",
@@ -25,6 +26,8 @@ __all__ = [
     "LLMClient",
     "LLMError",
     "MaxIterationsExceeded",
+    "SessionStore",
+    "StoreError",
     "TOOL_SCHEMAS",
     "ToolRunner",
     "load_config",

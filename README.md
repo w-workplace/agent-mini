@@ -1,9 +1,9 @@
 # coding-agent
 
-A minimal, **dependency-free** coding agent: give it a software-engineering
-task and it autonomously explores the codebase, edits files, runs commands to
-verify its work, and iterates until done — in the spirit of Claude Code, Codex,
-OpenCode, or DeepSeek Harness.
+A minimal, **dependency-free** coding agent with **git-like session
+management**: give it a software-engineering task and it autonomously explores
+the codebase, edits files, runs commands to verify, and iterates until done —
+in the spirit of Claude Code, Codex, OpenCode, or DeepSeek Harness.
 
 It talks to **any OpenAI-compatible chat-completions endpoint** using the
 model's native **tool calling**, and executes every tool **locally in this
@@ -11,16 +11,16 @@ process**. It depends on **nothing but the Python standard library**: no agent
 framework/SDK, no hosted code-execution or file APIs.
 
 ```console
-$ python -m coding_agent "Add a --verbose flag to the CLI and add a unit test for it"
+$ python -m coding_agent "Add a --verbose flag to the CLI and a unit test for it"
 ```
 
 ```
-[assistant] step 1: calling list_files
-[tool] list_files(...) -> {...}
-[assistant] step 2: calling read_file
-...
-Done: added --verbose; verified with `python -m unittest tests`.
+created ...
+[session 6f5a3c21]
 ```
+
+Every run is recorded as an immutable **session** (a git-like "commit"), stored
+in a dedicated workspace folder, with branches and rollback.
 
 ---
 
@@ -29,148 +29,177 @@ Done: added --verbose; verified with `python -m unittest tests`.
 | Requirement | Where it is satisfied |
 | --- | --- |
 | Interact with an LLM autonomously | `coding_agent/llm.py` + `coding_agent/agent.py` |
-| Read/write files, run commands | `coding_agent/tools.py` (`read_file`, `write_file`, `edit_file`, `list_files`, `grep`, `run_command`) |
+| Read/write files, run commands | `coding_agent/tools.py` |
 | Not a wrapper around an existing agent product | Everything is implemented from scratch |
-| No agent framework/SDK | stdlib only (`urllib`, `json`, `subprocess`, …) — see `pyproject.toml` (`dependencies = []`) |
-| Model vendor API client / OpenAI-compatible gateway allowed | `LLMClient` speaks the OpenAI chat-completions wire format over HTTPS |
-| No hosted code-execution or file tools (Code Interpreter / Files API) | All tools execute locally in-process; nothing is delegated |
-| Conversation history & context management | `Agent.messages` + `Agent._trim_context` (token budget, turn-aware trimming) |
-| Tool definition & local execution | `TOOL_SCHEMAS` (JSON schemas) + `ToolRunner` |
-| Model output parsing | `LLMClient._parse` (final text vs. `tool_calls`, malformed-argument handling) |
-| Loop termination conditions | final answer (no tool calls), `max_iterations` cap, repeat-detection guard (`_is_stuck`) |
-| Error handling | per-tool error dicts fed back to the model, HTTP retry with backoff, `AgentError`/`MaxIterationsExceeded` |
-| Credentials via env / untracked config | `coding_agent/config.py`; `.gitignore` excludes `config.json` / `.coding-agent.json` / `.env` |
+| No agent framework/SDK | stdlib only (`urllib`, `json`, `subprocess`, …) — `dependencies = []` |
+| Model vendor API / OpenAI-compatible gateway | `LLMClient` speaks the OpenAI chat-completions wire format |
+| No hosted code-execution / file tools | All tools execute locally in-process |
+| Conversation history & context management | `Agent.messages`, turn-aware compaction/trimming |
+| Tool definition & local execution | `TOOL_SCHEMAS` + `ToolRunner` |
+| Model output parsing | `LLMClient._parse` |
+| Loop termination | final answer / `max_iterations` / repeat-detection guard |
+| Error handling | tool error dicts fed back, HTTP retry, `AgentError`/`MaxIterationsExceeded` |
+| Credentials via env / untracked config | `config.py` + workspace `config.json` (git-ignored) |
+| **Session/workspace management** | `coding_agent/store.py` (sessions, branches, HEAD) |
+| **Cache-friendly context** | constant system prompt + append-only history + compaction |
 
 ---
 
 ## Installation
 
-No dependencies to install. Requires Python ≥ 3.9 (developed/tested on 3.12).
+No dependencies. Python ≥ 3.9 (tested on 3.12).
 
 ```console
-# Run straight from the source tree
-python -m coding_agent --help
-
-# Optional: install a `coding-agent` console script
-pip install -e .
+python -m coding_agent --help          # run straight from the source tree
+pip install -e .                       # optional: `coding-agent` console script
 ```
+
+## Quick start
+
+```console
+export LLM_API_KEY=sk-...             # or OPENAI_API_KEY
+export LLM_BASE_URL=https://api.openai.com/v1
+export LLM_MODEL=gpt-4o-mini
+
+python -m coding_agent "create a hello-world CLI and test it"
+python -m coding_agent status          # workspace / branch / HEAD
+python -m coding_agent log             # session history
+```
+
+## Session management (git-like)
+
+The agent keeps a **workspace** (default `~/.coding-agent`, override with
+`--workspace` / `LLM_WORKSPACE`) that holds everything:
+
+```
+~/.coding-agent/
+    config.json            # workspace config (untracked; may hold api_key)
+    work/                  # the agent's working directory (stable path)
+    sessions/<id>/
+        meta.json          # id, parent, task, message, model, timestamps
+        conversation.jsonl # the session log (one JSON message per line)
+        artifacts/         # snapshot of work/ when the session was sealed
+    refs/heads/<branch>    # named pointer -> session id
+    refs/HEAD              # -> "refs/heads/<branch>" or a bare session id
+```
+
+Sessions form a **tree** via `parent` (like commits); branches are named
+pointers to sessions; `HEAD` is the current session. Commands are short and
+memorable:
+
+```console
+coding-agent "task"              # run a task (new session)          [= run]
+coding-agent run "task" [-M msg] # explicit
+coding-agent status              # workspace / branch / HEAD
+coding-agent log [--all] [--oneline]   # session history (current branch)
+coding-agent show <ref>          # view a session's conversation
+coding-agent switch <ref>        # roll back HEAD (no file changes)
+coding-agent checkout <ref>      # roll back HEAD + restore work/ files
+coding-agent branch [<name>]     # list / create a branch
+coding-agent branch -d <name>    # delete a branch
+coding-agent rm <ref>            # delete a session
+coding-agent repl                # interactive (each turn = a session)
+coding-agent init                # initialize the workspace
+```
+
+- `<ref>` is a branch name or a session id (full or unique prefix).
+- `switch`/`checkout` roll HEAD back (like `git switch`/`git checkout`).
+- Guards keep the DAG safe: you can't delete the current session, a branch
+  tip, or a session that other sessions descend from.
+- `checkout <ref>` also restores `work/` from that session's artifact snapshot
+  (it **replaces** `work/` — like git checking out files). Use
+  `checkout <ref> --no-restore` to only move HEAD.
 
 ## Configuration
 
-Precedence (later wins):
-
-1. built-in defaults
-2. config file — project `.coding-agent.json`, then `~/.config/coding-agent/config.json`
-3. environment variables
-4. CLI flags
-
-### API key
-
-**Never** put your key in a committed file. Use an environment variable or an
-untracked config file:
+Precedence (later wins): defaults → project `.coding-agent.json` → workspace
+`config.json` → environment variables → CLI flags.
 
 ```console
 export LLM_API_KEY=sk-...            # or OPENAI_API_KEY
 export LLM_BASE_URL=https://api.openai.com/v1
 export LLM_MODEL=gpt-4o-mini
+export LLM_WORKSPACE=~/.coding-agent
 ```
 
-`LLM_BASE_URL` / `OPENAI_BASE_URL` and `LLM_MODEL` / `OPENAI_MODEL` are also
-recognized. Numeric options are exposed as `LLM_MAX_ITERATIONS`,
-`LLM_TEMPERATURE`, `LLM_CONTEXT_LIMIT_TOKENS`, etc. (see
-`coding_agent/config.py`).
-
-Any OpenAI-compatible gateway works — e.g. OpenAI, DeepSeek
+Any OpenAI-compatible gateway works — OpenAI, DeepSeek
 (`LLM_BASE_URL=https://api.deepseek.com`, `LLM_MODEL=deepseek-chat`), or a
-local server such as vLLM / llama.cpp.
+local server (vLLM / llama.cpp). Credentials go in an environment variable or
+the untracked workspace `config.json`; never commit them.
 
-### Config file
-
-Copy `config.example.json` to `.coding-agent.json` (project) or
-`~/.config/coding-agent/config.json` (user), and set `api_key` there if you
-prefer. Both are git-ignored.
-
-## Usage
-
-```console
-# One-shot task
-python -m coding_agent "Fix the failing unit test in tests/test_foo.py"
-
-# Read the task from stdin
-echo "refactor config.py to use dataclasses" | python -m coding_agent -
-
-# Interactive REPL (keeps context across turns)
-python -m coding_agent --interactive
-
-# Useful flags
-python -m coding_agent --workdir /path/to/project \
-    --max-iterations 50 --context-limit-tokens 128000 --verbose "..."
-
-python -m coding_agent --list-tools   # show the tool schemas
-python -m coding_agent --version
-```
+Key options (env `LLM_<UPPER>` / CLI): `max_iterations`, `context_limit_tokens`,
+`compact`, `max_tokens`, `temperature`, `command_timeout`,
+`allow_outside_workdir`, `allow_dangerous_commands`, `verbose`.
 
 ### Safety flags
 
-- `--workdir DIR` — the agent operates here; file tools are confined to it by
-  default.
-- `--allow-outside-workdir` — let file tools touch paths outside `--workdir`.
-- `--allow-dangerous-commands` — allow commands matching the blocked
-  destructive-command patterns (`rm -rf /`, `mkfs`, fork bombs, …).
+- `--workdir DIR` — override the working directory (default `<workspace>/work`).
+- `--allow-outside-workdir` — let file tools touch paths outside `workdir`.
+- `--allow-dangerous-commands` — allow the blocked destructive-command patterns
+  (`rm -rf /`, `mkfs`, fork bombs, …).
 
-> `run_command` executes with your user privileges, so run the agent in a
-> sandbox/container for untrusted tasks. The danger-pattern blocklist is a
-> best-effort guardrail, **not** a security boundary.
+> `run_command` executes with your user privileges. The danger-pattern
+> blocklist is a best-effort guardrail, **not** a security boundary — run the
+> agent in a container for untrusted work.
+
+## Cache-friendly context management
+
+Prompt caches (Anthropic prompt caching, OpenAI/DeepSeek automatic prefix
+caching) only hit when a request's **prefix** is byte-identical. The agent
+follows three rules to keep hit rates high:
+
+1. **Constant system prompt** — no session id, branch, timestamp, or absolute
+   working-directory interpolation (the model is told it works in a dedicated
+   directory and should use relative paths; `ToolRunner` resolves them).
+2. **Append-only history** — continuing a session re-sends the parent session's
+   messages verbatim as the prefix and only appends new turns; the parent
+   chain never rewrites history.
+3. **Compaction, not front-drop** — when the token budget is exceeded,
+   `--compact` summarizes the oldest turns into one stable block placed right
+   after the system prompt (`[Prior conversation summary] …`). That keeps the
+   prefix stable instead of evicting the cache by dropping the front. Without
+   `--compact` it falls back to dropping the oldest turns.
 
 ## Architecture
 
 ```
 coding_agent/
-├── cli.py      # argparse CLI + REPL
-├── config.py   # defaults ← file ← env ← CLI precedence
+├── cli.py      # argparse CLI + git-like subcommands + REPL
+├── config.py   # defaults ← project config ← workspace config ← env ← CLI
 ├── llm.py      # OpenAI-compatible HTTP client, retry, response parsing
 ├── tools.py    # tool JSON schemas + local executors + safety guards
-├── agent.py    # the loop: context mgmt, termination, error handling
+├── store.py    # workspace/session/branch/HEAD store (git-like DAG)
+├── agent.py    # the loop + context compaction/trimming + termination
 └── __main__.py # python -m coding_agent
 ```
 
 ### The agent loop (`Agent.run`)
 
-1. Append the user's task to `self.messages`.
-2. **Trim** history to the token budget, turn-aware (never splits a tool call
-   from its result).
+1. Append the user's task to the (parent-session-seeded) message history.
+2. Manage context: compact or trim if over the token budget.
 3. Call the model with the conversation + `TOOL_SCHEMAS`.
-4. **Parse** the reply. If there are no `tool_calls`, it's the final answer —
-   stop.
-5. Otherwise **execute** every requested tool locally and append each result as
-   a `tool` message (keyed by `tool_call_id`).
-6. Repeat until termination: a final answer, `max_iterations`, or the
-   repeat-detection guard (the model made the same tool call ≥3 times in a row
-   with no progress).
-
-Tool failures are returned to the model as `{"ok": false, "error": ...}` so it
-can diagnose and retry. Transient HTTP errors (429/5xx) are retried with
-exponential backoff in `LLMClient.chat`.
+4. Parse the reply; no `tool_calls` → final answer, stop.
+5. Otherwise execute every requested tool locally and feed results back.
+6. Repeat until a final answer, `max_iterations`, or the repeat-detection guard.
 
 ## Testing
 
-No third-party test runner needed — the suite uses `unittest` and a
-scriptable local mock of the OpenAI endpoint.
+No third-party runner — `unittest` plus a scriptable local mock of the OpenAI
+endpoint:
 
 ```console
 python -m unittest discover -s tests -v
 ```
 
-The tests cover: every tool executor (including path-escape and
-dangerous-command guards), config precedence, LLM parsing and retry, and the
-full agent loop end-to-end against the fake server (tool call → local
-execution → result → final answer), plus iteration caps and the stuck guard.
+63 tests cover every tool executor, config precedence, LLM parsing/retry, the
+full agent loop end-to-end, context compaction, the session/branch store (DAG,
+guards, artifacts), and the CLI run flow.
 
 ## Limitations / ideas
 
-- No vision, no MCP, no sub-agents, no streaming output.
-- `run_command` has no OS-level sandbox; pair it with a container for untrusted
-  work.
+- No vision, MCP, sub-agents, or streaming output; no OS-level sandbox for
+  `run_command`.
 - Token estimation is a rough ~4 chars/token heuristic.
-- `max_tokens` is omitted by default (0) for maximum endpoint compatibility;
-  reasoning models may ignore `temperature`/`max_tokens`.
+- Artifact snapshots copy the working directory (skipping VCS/build dirs,
+  capped at 100 MiB) rather than diffing; for large external projects prefer
+  `--workdir` with care, since `checkout` only restores `work/`.

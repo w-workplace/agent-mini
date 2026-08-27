@@ -4,9 +4,14 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from coding_agent.agent import Agent, AgentError, MaxIterationsExceeded
+from coding_agent.agent import (
+    SUMMARY_MARKER,
+    Agent,
+    AgentError,
+    MaxIterationsExceeded,
+)
 from coding_agent.config import Config
-from coding_agent.llm import LLMClient
+from coding_agent.llm import AssistantMessage, LLMClient
 from coding_agent.tools import ToolRunner
 from tests.fake_server import FakeOpenAIServer, final_response, tool_call_response
 
@@ -153,6 +158,49 @@ class AgentUnitTestCase(unittest.TestCase):
         for i, role in enumerate(roles):
             if role == "tool":
                 self.assertEqual(roles[i - 1], "assistant")
+
+    def test_history_injected_after_system(self):
+        agent = Agent(
+            Config(api_key="k", model="m"),
+            history=[{"role": "user", "content": "past"}],
+        )
+        # System prompt stays first and constant; history follows verbatim.
+        self.assertEqual(agent.messages[0]["role"], "system")
+        self.assertEqual(agent.messages[1], {"role": "user", "content": "past"})
+
+    def test_system_prompt_is_constant(self):
+        a = Agent(Config(api_key="k", model="m"))
+        b = Agent(Config(api_key="k", model="m"))
+        self.assertEqual(a.messages[0]["content"], b.messages[0]["content"])
+
+
+class _FakeSummarizerLLM:
+    def chat(self, messages, tools=None):
+        if tools is None:
+            return AssistantMessage(content="THE SUMMARY")
+        raise AssertionError("main chat should not run during compaction")
+
+
+class CompactionTestCase(unittest.TestCase):
+    def test_compact_folds_oldest_into_stable_summary(self):
+        config = Config(api_key="k", model="m", compact=True, context_limit_tokens=500)
+        agent = Agent(config)
+        agent.llm = _FakeSummarizerLLM()
+        messages = [{"role": "system", "content": "sys"}]
+        for i in range(50):
+            messages.append({"role": "user", "content": f"old turn {i} " + "x" * 100})
+        messages.append({"role": "user", "content": "recent " + "y" * 100})
+
+        out = agent._compact(messages)
+
+        self.assertEqual(out[0]["role"], "system")
+        self.assertTrue(out[1]["content"].startswith(SUMMARY_MARKER))
+        self.assertIn("THE SUMMARY", out[1]["content"])
+        # the newest turn is retained verbatim
+        self.assertIn("recent", out[-1]["content"])
+        # the summary sits immediately after system (stable prefix)
+        self.assertEqual(out[1]["role"], "user")
+        self.assertLessEqual(agent._estimate_tokens(out), 500)
 
 
 if __name__ == "__main__":

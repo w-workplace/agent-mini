@@ -14,6 +14,9 @@ config.json
 .env
 *.secret
 
+# A workspace created inside the repo
+.coding-agent/
+
 # Editor / OS
 .idea/
 .vscode/
