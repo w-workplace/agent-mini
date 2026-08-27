@@ -1,0 +1,159 @@
+"""End-to-end and unit tests for the agent loop."""
+
+import tempfile
+import unittest
+from pathlib import Path
+
+from coding_agent.agent import Agent, AgentError, MaxIterationsExceeded
+from coding_agent.config import Config
+from coding_agent.llm import LLMClient
+from coding_agent.tools import ToolRunner
+from tests.fake_server import FakeOpenAIServer, final_response, tool_call_response
+
+
+def _scenario_create_and_verify():
+    """A scripted model: list -> write -> run -> finish.
+
+    Each chat call advances one step, so this exercises the whole loop:
+    tool calling, local execution, results fed back, and termination on a
+    final answer with no tool calls.
+    """
+    state = {"n": 0}
+
+    def scenario(handler, body):
+        n = state["n"]
+        state["n"] += 1
+        if n == 0:
+            return tool_call_response("list_files", {"pattern": "*"}, "call_0")
+        if n == 1:
+            return tool_call_response(
+                "write_file",
+                {"path": "greeting.txt", "content": "hello from coding-agent\n"},
+                "call_1",
+            )
+        if n == 2:
+            return tool_call_response(
+                "run_command", {"command": "cat greeting.txt"}, "call_2"
+            )
+        return final_response("Done: created greeting.txt and verified its contents.")
+
+    return scenario
+
+
+class AgentEndToEndTestCase(unittest.TestCase):
+    def test_full_loop(self):
+        server = FakeOpenAIServer(_scenario_create_and_verify())
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Config(
+                base_url=server.base_url,
+                api_key="test-key",
+                model="fake-model",
+                workdir=tmp,
+                max_iterations=10,
+            )
+            agent = Agent(config)
+            try:
+                answer = agent.run("Create a greeting file and verify it.")
+            finally:
+                server.shutdown()
+            self.assertEqual(answer, "Done: created greeting.txt and verified its contents.")
+            self.assertTrue(Path(tmp, "greeting.txt").exists())
+            self.assertEqual(
+                Path(tmp, "greeting.txt").read_text(), "hello from coding-agent\n"
+            )
+
+    def test_max_iterations_exceeded(self):
+        state = {"n": 0}
+
+        def infinite_tools(handler, body):
+            # Always ask for a (distinct) tool call so the loop never reaches
+            # a final answer, but the repeat-detection guard is not triggered.
+            state["n"] += 1
+            return tool_call_response(
+                "list_files", {"pattern": f"pattern_{state['n']}"}, f"call_{state['n']}"
+            )
+
+        server = FakeOpenAIServer(infinite_tools)
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Config(
+                base_url=server.base_url,
+                api_key="k",
+                model="m",
+                workdir=tmp,
+                max_iterations=3,
+            )
+            agent = Agent(config)
+            try:
+                with self.assertRaises(MaxIterationsExceeded):
+                    agent.run("never finish")
+            finally:
+                server.shutdown()
+
+    def test_error_fed_back_to_model(self):
+        """A tool that fails should return its error to the model and continue."""
+        state = {"n": 0}
+
+        def scenario(handler, body):
+            n = state["n"]
+            state["n"] += 1
+            if n == 0:
+                return tool_call_response("read_file", {"path": "missing.txt"}, "call_0")
+            return final_response("recovered after seeing the error")
+
+        server = FakeOpenAIServer(scenario)
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Config(base_url=server.base_url, api_key="k", model="m", workdir=tmp)
+            agent = Agent(config)
+            try:
+                answer = agent.run("read a missing file")
+            finally:
+                server.shutdown()
+            self.assertEqual(answer, "recovered after seeing the error")
+
+
+class AgentUnitTestCase(unittest.TestCase):
+    def _agent(self, **overrides):
+        config = Config(api_key="k", model="m", **overrides)
+        return Agent(config)
+
+    def test_is_stuck(self):
+        sig = ((("list_files", '{"pattern":"*"}'),),)
+        self.assertTrue(Agent._is_stuck([sig, sig, sig]))
+        self.assertFalse(Agent._is_stuck([sig, sig]))
+        self.assertFalse(Agent._is_stuck([sig, (("read_file", '{"path":"x"}'),), sig]))
+
+    def test_estimate_tokens(self):
+        agent = self._agent()
+        msgs = [{"role": "user", "content": "x" * 40}]  # ~10 tokens
+        self.assertGreaterEqual(agent._estimate_tokens(msgs), 10)
+
+    def test_trim_context_keeps_system_and_latest(self):
+        agent = self._agent(context_limit_tokens=100)
+        messages = [{"role": "system", "content": "sys"}]
+        for i in range(20):
+            messages.append({"role": "user", "content": f"turn {i} " + "y" * 100})
+        trimmed = agent._trim_context(messages)
+        self.assertEqual(trimmed[0]["role"], "system")
+        self.assertEqual(trimmed[-1]["role"], "user")
+        self.assertLessEqual(agent._estimate_tokens(trimmed), 100)
+        self.assertIn("turn 19", trimmed[-1]["content"])
+
+    def test_trim_context_keeps_tool_pairing(self):
+        agent = self._agent(context_limit_tokens=200)
+        messages = [
+            {"role": "system", "content": "sys " + "z" * 800},
+            {"role": "user", "content": "task"},
+            {"role": "assistant", "content": None, "tool_calls": []},
+            {"role": "tool", "tool_call_id": "c", "content": "result"},
+        ]
+        trimmed = agent._trim_context(messages)
+        # The system message alone exceeds budget; tool/assistant pair may drop
+        # but must never leave an orphan tool message without its assistant.
+        roles = [m["role"] for m in trimmed]
+        for i, role in enumerate(roles):
+            if role == "tool":
+                self.assertEqual(roles[i - 1], "assistant")
+
+
+if __name__ == "__main__":
+    unittest.main()

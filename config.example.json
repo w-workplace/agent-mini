@@ -1,0 +1,13 @@
+{
+  "base_url": "https://api.openai.com/v1",
+  "model": "gpt-4o-mini",
+  "max_iterations": 40,
+  "max_tokens": 0,
+  "temperature": 0.2,
+  "context_limit_tokens": 64000,
+  "workdir": ".",
+  "command_timeout": 120.0,
+  "allow_outside_workdir": false,
+  "allow_dangerous_commands": false,
+  "verbose": false
+}

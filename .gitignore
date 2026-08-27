@@ -1,0 +1,20 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# Secrets / config — credentials must NOT be committed
+config.json
+.coding-agent.json
+.env
+*.secret
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
