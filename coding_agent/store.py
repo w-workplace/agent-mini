@@ -29,6 +29,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from .graph import render_graph
+
 ID_BYTES = 4  # -> 8 hex chars per session id
 
 # Directories/files skipped when snapshotting artifacts.
@@ -293,8 +295,8 @@ class SessionStore:
                 break
         return seen
 
-    def log(self, all_branches: bool = False) -> list[dict[str, Any]]:
-        """Sessions reachable from HEAD (or all tips), newest first."""
+    def _reachable(self, all_branches: bool = False) -> list[str]:
+        """Ids reachable from HEAD (or all tips), newest first."""
         metas = {m["id"]: m for m in self.list_sessions()}
         tips: set[str] = set()
         if all_branches:
@@ -305,9 +307,40 @@ class SessionStore:
         reachable: set[str] = set()
         for tip in tips:
             reachable |= self.ancestors(tip)
-        ordered = [metas[sid] for sid in reachable if sid in metas]
-        ordered.sort(key=lambda m: m.get("created_at", 0), reverse=True)
+        ordered = [sid for sid in reachable if sid in metas]
+        ordered.sort(key=lambda sid: metas[sid].get("created_at", 0), reverse=True)
         return ordered
+
+    def log(self, all_branches: bool = False) -> list[dict[str, Any]]:
+        """Sessions reachable from HEAD (or all tips), newest first."""
+        metas = {m["id"]: m for m in self.list_sessions()}
+        return [metas[sid] for sid in self._reachable(all_branches)]
+
+    def graph(self, all_branches: bool = False) -> list[str]:
+        """Return ``git log --graph``-style lines for the session DAG."""
+        metas = {m["id"]: m for m in self.list_sessions()}
+        ordered = self._reachable(all_branches)
+
+        parents = {sid: (metas[sid].get("parent") or None) for sid in ordered}
+
+        head = self.resolve_head()
+        refs: dict[str, list[str]] = {}
+        for name, tip in self.list_branches().items():
+            if tip:
+                refs.setdefault(tip, []).append(name)
+        if head:
+            refs.setdefault(head, []).append("HEAD")
+
+        labels: dict[str, str] = {}
+        for sid in ordered:
+            m = metas[sid]
+            parts = [m.get("message", "") or sid]
+            names = refs.get(sid)
+            if names:
+                parts.append("(" + ", ".join(names) + ")")
+            labels[sid] = " ".join(parts)
+
+        return render_graph(ordered, parents, labels)
 
     def delete_session(self, ref: str) -> None:
         sid = self.resolve_ref(ref)

@@ -91,19 +91,23 @@ memorable:
 coding-agent "task"              # run a task (new session)          [= run]
 coding-agent run "task" [-M msg] # explicit
 coding-agent status              # workspace / branch / HEAD
-coding-agent log [--all] [--oneline]   # session history (current branch)
+coding-agent log [--all] [--graph] [--oneline]   # session history (DAG)
 coding-agent show <ref>          # view a session's conversation
 coding-agent switch <ref>        # roll back HEAD (no file changes)
 coding-agent checkout <ref>      # roll back HEAD + restore work/ files
 coding-agent branch [<name>]     # list / create a branch
 coding-agent branch -d <name>    # delete a branch
 coding-agent rm <ref>            # delete a session
-coding-agent repl                # interactive (each turn = a session)
+coding-agent repl                # interactive (turns merge into ONE session)
 coding-agent init                # initialize the workspace
 ```
 
 - `<ref>` is a branch name or a session id (full or unique prefix).
 - `switch`/`checkout` roll HEAD back (like `git switch`/`git checkout`).
+- `log --graph` renders the session DAG like `git log --graph` (`*` commits,
+  `|` lines, `/` `\` forks/merges), with branch/HEAD markers.
+- `repl` merges every turn into **one** session (sealed when you exit), rather
+  than recording a session per turn.
 - Guards keep the DAG safe: you can't delete the current session, a branch
   tip, or a session that other sessions descend from.
 - `checkout <ref>` also restores `work/` from that session's artifact snapshot
@@ -129,7 +133,27 @@ the untracked workspace `config.json`; never commit them.
 
 Key options (env `LLM_<UPPER>` / CLI): `max_iterations`, `context_limit_tokens`,
 `compact`, `max_tokens`, `temperature`, `command_timeout`,
-`allow_outside_workdir`, `allow_dangerous_commands`, `verbose`.
+`allow_outside_workdir`, `allow_dangerous_commands`, `verbose`, `quiet`.
+
+### Progress & branch display
+
+While a task runs, a concise progress stream is printed to stderr (the final
+answer stays on stdout for scripting):
+
+```
+[run] branch main · model gpt-4o-mini · ~/.coding-agent/work
+[step 1/40] list_files({"pattern": "*"})
+  ok (count=0)
+[step 2/40] write_file({"path": "greeting.txt", ...})
+  ok (bytes_written=6)
+[step 3/40] run_command("cat greeting.txt")
+  ok (exit_code=0)
+[session 530576fc] on branch main
+```
+
+The current branch is shown in the run header/footer, in `status`, and in the
+REPL prompt (`main>` / `(detached)>`). Use `--verbose` for full tool results and
+interim assistant text, or `--quiet` to suppress the progress stream entirely.
 
 ### Safety flags
 
@@ -191,9 +215,9 @@ endpoint:
 python -m unittest discover -s tests -v
 ```
 
-63 tests cover every tool executor, config precedence, LLM parsing/retry, the
+71 tests cover every tool executor, config precedence, LLM parsing/retry, the
 full agent loop end-to-end, context compaction, the session/branch store (DAG,
-guards, artifacts), and the CLI run flow.
+guards, artifacts), DAG graph rendering, and the CLI run/REPL flow.
 
 ## Limitations / ideas
 

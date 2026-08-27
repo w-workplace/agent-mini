@@ -1,5 +1,7 @@
 """End-to-end and unit tests for the agent loop."""
 
+import contextlib
+import io
 import tempfile
 import unittest
 from pathlib import Path
@@ -172,6 +174,39 @@ class AgentUnitTestCase(unittest.TestCase):
         a = Agent(Config(api_key="k", model="m"))
         b = Agent(Config(api_key="k", model="m"))
         self.assertEqual(a.messages[0]["content"], b.messages[0]["content"])
+
+    def test_result_summary(self):
+        self.assertEqual(
+            Agent._result_summary({"ok": True, "exit_code": 0}), "ok (exit_code=0)"
+        )
+        self.assertEqual(
+            Agent._result_summary({"ok": True, "bytes_written": 24}), "ok (bytes_written=24)"
+        )
+        self.assertEqual(
+            Agent._result_summary({"ok": False, "error": "boom"}), "error: boom"
+        )
+
+    def test_progress_gating(self):
+        quiet = Agent(Config(api_key="k", model="m", quiet=True))
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            quiet._progress("P")
+            quiet._detail("D")
+        self.assertEqual(buf.getvalue(), "")
+
+        default = Agent(Config(api_key="k", model="m"))
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            default._progress("P")
+            default._detail("D")
+        self.assertIn("P", buf.getvalue())
+        self.assertNotIn("D", buf.getvalue())
+
+        verbose = Agent(Config(api_key="k", model="m", verbose=True))
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            verbose._detail("D")
+        self.assertIn("D", buf.getvalue())
 
 
 class _FakeSummarizerLLM:

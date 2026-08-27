@@ -7,14 +7,14 @@ roll HEAD back. Commands are short and memorable:
     coding-agent "task"            # run a task (new session)   [= run "task"]
     coding-agent run "task"        # explicit
     coding-agent status            # workspace / branch / HEAD
-    coding-agent log [--all]       # session history (current branch)
+    coding-agent log [--all] [--graph] [--oneline]   # session history (DAG)
     coding-agent show <ref>        # view a session's conversation
     coding-agent switch <ref>      # move HEAD (no file changes)
     coding-agent checkout <ref>    # move HEAD + restore work/ artifacts
     coding-agent branch [<name>]   # list / create a branch
     coding-agent branch -d <name>  # delete a branch
     coding-agent rm <ref>          # delete a session
-    coding-agent repl              # interactive (each turn = a session)
+    coding-agent repl              # interactive (turns merge into ONE session)
     coding-agent init              # initialize the workspace
 """
 
@@ -39,7 +39,7 @@ KNOWN_COMMANDS = {
 }
 
 _REPL_BANNER = """\
-coding-agent REPL — each turn is recorded as a new session (git-like commit).
+coding-agent REPL — turns are merged into ONE session (sealed on exit).
   /status   workspace & branch status
   /log      recent sessions
   /branch   list branches
@@ -77,6 +77,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--allow-dangerous-commands", action="store_true",
                    help="Allow commands that match the blocked dangerous-command patterns.")
     p.add_argument("-v", "--verbose", action="store_true", help="Log each agent/tool step to stderr.")
+    p.add_argument("-q", "--quiet", action="store_true", help="Suppress progress output (stderr).")
     p.add_argument("-i", "--interactive", action="store_true", help="Alias for `repl`.")
     p.add_argument("--list-tools", action="store_true", help="Print available tools and exit.")
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
@@ -93,7 +94,7 @@ def _cli_overrides(opts: argparse.Namespace) -> dict[str, Any]:
         value = getattr(opts, key, None)
         if value is not None:
             overrides[key] = value
-    for flag in ("allow_outside_workdir", "allow_dangerous_commands", "verbose", "compact"):
+    for flag in ("allow_outside_workdir", "allow_dangerous_commands", "verbose", "compact", "quiet"):
         if getattr(opts, flag, False):
             overrides[flag] = True
     return overrides
@@ -127,6 +128,9 @@ def _resolve_workdir(config: Any, opts: argparse.Namespace, store: SessionStore)
 def _run_task(config: Any, store: SessionStore, workdir: str, task: str, message: str | None = None) -> int:
     head = store.resolve_head()
     history = store.load_conversation(head) if head else None
+    branch = store.current_branch() or "(detached)"
+    if not getattr(config, "quiet", False):
+        print(f"[run] branch {branch} · model {config.model} · {workdir}", file=sys.stderr)
     agent = _build_agent(config, workdir, history=history)
     try:
         answer = agent.run(task)
@@ -142,7 +146,8 @@ def _run_task(config: Any, store: SessionStore, workdir: str, task: str, message
     store.advance_head(sid)
 
     print(answer)
-    print(f"[session {sid}]", file=sys.stderr)
+    if not getattr(config, "quiet", False):
+        print(f"[session {sid}] on branch {store.current_branch() or '(detached)'}", file=sys.stderr)
     return 0
 
 
@@ -179,7 +184,13 @@ def _status(store: SessionStore) -> int:
     return 0
 
 
-def _log(store: SessionStore, all_branches: bool, oneline: bool) -> int:
+def _log(store: SessionStore, all_branches: bool, oneline: bool, graph: bool = False) -> int:
+    if graph:
+        for line in store.graph(all_branches):
+            print(line)
+        if not store.list_sessions():
+            print("no sessions yet")
+        return 0
     entries = store.log(all_branches)
     branches = store.list_branches()
     head = store.resolve_head()
@@ -293,10 +304,19 @@ def _init(store: SessionStore) -> int:
 
 
 def _repl(opts: argparse.Namespace, config: Any, store: SessionStore, workdir: str) -> int:
+    branch = store.current_branch() or "(detached)"
     print(_REPL_BANNER, file=sys.stderr)
+    if not getattr(config, "quiet", False):
+        print(f"[repl] branch {branch} · {workdir}", file=sys.stderr)
+    prompt = f"{branch}> "
+    head = store.resolve_head()
+    history = store.load_conversation(head) if head else None
+    agent = _build_agent(config, workdir, history=history)
+    initial_len = len(agent.messages)
+    first_task = ""
     while True:
         try:
-            line = input("> ")
+            line = input(prompt)
         except (EOFError, KeyboardInterrupt):
             print(file=sys.stderr)
             break
@@ -320,7 +340,28 @@ def _repl(opts: argparse.Namespace, config: Any, store: SessionStore, workdir: s
         if s.startswith("/"):
             print(f"unknown command {s!r}", file=sys.stderr)
             continue
-        _run_task(config, store, workdir, line)
+        if not first_task:
+            first_task = s
+        try:
+            answer = agent.run(s)
+        except AgentError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            continue
+        print(answer)
+
+    # Seal the whole REPL interaction as ONE session (multi-turn, single commit).
+    if len(agent.messages) > initial_len:
+        sid = store.create_session(
+            task=first_task,
+            parent=head,
+            message=opts.message,
+            workdir=workdir,
+            model=config.model,
+        )
+        store.save_conversation(sid, agent.messages[1:])
+        store.snapshot_artifacts(sid, workdir)
+        store.advance_head(sid)
+        print(f"[session {sid}]", file=sys.stderr)
     return 0
 
 
@@ -343,7 +384,7 @@ def _dispatch(opts: argparse.Namespace, cmd: str, cmd_args: list[str]) -> int:
     if cmd == "status":
         return _status(SessionStore(config.workspace))
     if cmd == "log":
-        return _log(SessionStore(config.workspace), "--all" in cmd_args, "--oneline" in cmd_args)
+        return _log(SessionStore(config.workspace), "--all" in cmd_args, "--oneline" in cmd_args, "--graph" in cmd_args)
     if cmd == "show":
         ref = next((a for a in cmd_args if not a.startswith("-")), None)
         if not ref:

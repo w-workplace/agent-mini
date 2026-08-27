@@ -39,6 +39,7 @@ DEFAULTS: dict[str, Any] = {
     "command_timeout": 120.0,
     "compact": False,  # summarize oldest turns instead of dropping them
     "verbose": False,
+    "quiet": False,  # suppress progress output
     "system_prompt": "",
 }
 
@@ -70,6 +71,7 @@ _BOOLEAN_CASTERS: dict[str, Callable[[str], bool]] = {
     "allow_dangerous_commands": _parse_bool,
     "compact": _parse_bool,
     "verbose": _parse_bool,
+    "quiet": _parse_bool,
 }
 
 
@@ -91,6 +93,7 @@ class Config:
     command_timeout: float = DEFAULTS["command_timeout"]
     compact: bool = False
     verbose: bool = False
+    quiet: bool = False
     system_prompt: str = ""
 
     def to_dict(self) -> dict[str, Any]:

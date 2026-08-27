@@ -55,6 +55,22 @@ class SessionStoreTestCase(unittest.TestCase):
         ])
         self.assertEqual(entries[0]["message"], "three")
 
+    def test_graph_renders_fork(self):
+        a = self._run("base")
+        self.store.create_branch("feature")   # feature -> a
+        b = self._run("main work")            # main -> b (parent a)
+        self.store.checkout("feature")
+        c = self._run("feature work")         # feature -> c (parent a)
+        lines = self.store.graph(all_branches=True)
+        # exactly one "*" line per session
+        self.assertEqual(sum(1 for ln in lines if "*" in ln), 3)
+        text = "\n".join(lines)
+        self.assertIn("HEAD", text)
+        self.assertIn("main", text)
+        self.assertIn("feature", text)
+        # a fork is drawn with a connector
+        self.assertTrue(any("/" in ln or "\\" in ln for ln in lines))
+
     def test_branch_create_and_list(self):
         sid = self._run("base")
         self.store.create_branch("feature")

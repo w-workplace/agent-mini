@@ -124,8 +124,7 @@ class Agent:
                 raise AgentError(f"LLM call failed: {exc.message}") from exc
 
             self.messages.append(reply.to_api_dict())
-            if self.config.verbose:
-                self._log_step(step, reply)
+            self._show_step(step, reply)
 
             if not reply.tool_calls:
                 final_answer = reply.content or "(the model returned no text)"
@@ -134,6 +133,7 @@ class Agent:
             signature: list[tuple[str, str]] = []
             for tc in reply.tool_calls:
                 signature.append((tc.name, json.dumps(tc.arguments, sort_keys=True)))
+                self._show_tool_start(step, tc)
                 result = self.tools.execute(tc.name, tc.arguments)
                 self.messages.append(
                     {
@@ -142,12 +142,7 @@ class Agent:
                         "content": format_tool_result(result),
                     }
                 )
-                if self.config.verbose:
-                    print(
-                        f"[tool] {tc.name}({json.dumps(tc.arguments, ensure_ascii=False)}) "
-                        f"-> {format_tool_result(result)[:600]}",
-                        file=sys.stderr,
-                    )
+                self._show_tool_end(result)
 
             signatures.append(tuple(signature))
             if self._is_stuck(signatures):
@@ -162,6 +157,47 @@ class Agent:
             )
 
         return final_answer
+
+    # -- progress output ------------------------------------------------------
+    def _progress(self, message: str) -> None:
+        """Concise per-step progress, shown unless ``quiet``."""
+        if not getattr(self.config, "quiet", False):
+            print(message, file=sys.stderr, flush=True)
+
+    def _detail(self, message: str) -> None:
+        """Verbose detail, shown only with ``--verbose``."""
+        if not getattr(self.config, "quiet", False) and self.config.verbose:
+            print(message, file=sys.stderr, flush=True)
+
+    @staticmethod
+    def _fmt_args(arguments: dict[str, Any]) -> str:
+        s = json.dumps(arguments, ensure_ascii=False)
+        return s if len(s) <= 120 else s[:120] + "…"
+
+    @staticmethod
+    def _result_summary(result: dict[str, Any]) -> str:
+        if result.get("ok"):
+            for key in ("exit_code", "bytes_written", "replacements", "count", "lines_returned"):
+                if key in result:
+                    return f"ok ({key}={result[key]})"
+            return "ok"
+        err = str(result.get("error", "error")).replace("\n", " ")[:120]
+        return f"error: {err}"
+
+    def _show_step(self, step: int, reply: Any) -> None:
+        if reply.content and reply.tool_calls:
+            self._detail(
+                f"[assistant] {reply.content.strip().replace(chr(10), ' ')[:200]}"
+            )
+
+    def _show_tool_start(self, step: int, tc: Any) -> None:
+        self._progress(
+            f"[step {step}/{self.config.max_iterations}] "
+            f"{tc.name}({self._fmt_args(tc.arguments)})"
+        )
+
+    def _show_tool_end(self, result: dict[str, Any]) -> None:
+        self._progress(f"  {self._result_summary(result)}")
 
     # -- context management ---------------------------------------------------
     def _estimate_tokens(self, messages: list[dict[str, Any]]) -> int:
@@ -294,11 +330,10 @@ class Agent:
 
         if self._estimate_tokens(out) > limit:
             return self._trim_context(messages)
-        if self.config.verbose and len(out) < len(messages):
-            print(
+        if len(out) < len(messages):
+            self._progress(
                 f"[context] compacted {len(messages) - len(out)} messages into "
-                "a summary to fit the token budget",
-                file=sys.stderr,
+                "a summary to fit the token budget"
             )
         return out
 
@@ -325,11 +360,10 @@ class Agent:
             out.append(system)
         for turn in keep:
             out.extend(turn)
-        if self.config.verbose and len(out) < len(messages):
-            print(
+        if len(out) < len(messages):
+            self._progress(
                 f"[context] trimmed {len(messages) - len(out)} messages to fit "
-                f"the {limit}-token budget",
-                file=sys.stderr,
+                f"the {limit}-token budget"
             )
         return out
 
@@ -341,12 +375,3 @@ class Agent:
             return False
         recent = signatures[-window:]
         return all(s == recent[0] for s in recent)
-
-    # -- logging --------------------------------------------------------------
-    @staticmethod
-    def _log_step(step: int, reply: Any) -> None:
-        if reply.content:
-            print(f"[assistant] {reply.content}", file=sys.stderr)
-        if reply.tool_calls:
-            names = ", ".join(tc.name for tc in reply.tool_calls)
-            print(f"[assistant] step {step}: calling {names}", file=sys.stderr)

@@ -3,6 +3,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from coding_agent.cli import main
 from coding_agent.store import SessionStore
@@ -71,6 +72,33 @@ class CLIRunTestCase(unittest.TestCase):
             self.assertEqual(main(["--workspace", ws, "branch", "feature"]), 0)
             self.assertEqual(store.list_branches()["feature"], head)
             self.assertEqual(main(["--workspace", ws, "log", "--oneline"]), 0)
+
+    def test_repl_merges_turns_into_one_session(self):
+        server = FakeOpenAIServer(lambda handler, body: final_response("ok"))
+        with tempfile.TemporaryDirectory() as ws:
+            with mock.patch("builtins.input", side_effect=["first task", "second task", "/exit"]):
+                try:
+                    rc = main(["--workspace", ws, "--base-url", server.base_url,
+                               "--api-key", "k", "--model", "m", "repl"])
+                finally:
+                    server.shutdown()
+            self.assertEqual(rc, 0)
+            store = SessionStore(ws)
+            sessions = store.list_sessions()
+            self.assertEqual(len(sessions), 1)  # one session, not one per turn
+            conv = store.load_conversation(store.resolve_head())
+            user_msgs = [m["content"] for m in conv if m["role"] == "user"]
+            self.assertEqual(user_msgs, ["first task", "second task"])
+
+    def test_log_graph_flag(self):
+        server = FakeOpenAIServer(_scenario())
+        with tempfile.TemporaryDirectory() as ws:
+            try:
+                main(["--workspace", ws, "--base-url", server.base_url,
+                      "--api-key", "k", "--model", "m", "run", "first"])
+            finally:
+                server.shutdown()
+            self.assertEqual(main(["--workspace", ws, "log", "--graph"]), 0)
 
 
 if __name__ == "__main__":
