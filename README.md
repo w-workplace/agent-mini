@@ -35,13 +35,14 @@ in a dedicated workspace folder, with branches and rollback.
 | Model vendor API / OpenAI-compatible gateway | `LLMClient` speaks the OpenAI chat-completions wire format |
 | No hosted code-execution / file tools | All tools execute locally in-process |
 | Conversation history & context management | `Agent.messages`, turn-aware compaction/trimming |
-| Tool definition & local execution | `TOOL_SCHEMAS` + `ToolRunner` |
+| Tool definition & local execution | `TOOL_SCHEMAS` + `ToolRunner` (explicit allowlist + schema validation) |
 | Model output parsing | `LLMClient._parse` |
 | Loop termination | final answer / `max_iterations` / repeat-detection guard |
 | Error handling | tool error dicts fed back, HTTP retry, `AgentError`/`MaxIterationsExceeded` |
 | Credentials via env / untracked config | `config.py` + workspace `config.json` (git-ignored) |
 | **Session/workspace management** | `coding_agent/store.py` (sessions, branches, HEAD) |
 | **Cache-friendly context** | constant system prompt + append-only history + compaction |
+| **Security** | `coding_agent/security.py` (sandbox, env scrubbing, redaction) |
 
 ---
 
@@ -132,8 +133,9 @@ local server (vLLM / llama.cpp). Credentials go in an environment variable or
 the untracked workspace `config.json`; never commit them.
 
 Key options (env `LLM_<UPPER>` / CLI): `max_iterations`, `context_limit_tokens`,
-`compact`, `max_tokens`, `temperature`, `command_timeout`,
-`allow_outside_workdir`, `allow_dangerous_commands`, `verbose`, `quiet`.
+`compact`, `max_tokens`, `temperature`, `command_timeout`, `sandbox`,
+`env_allow`, `allow_outside_workdir`, `allow_dangerous_commands`, `verbose`,
+`quiet`.
 
 ### Progress & branch display
 
@@ -155,16 +157,33 @@ The current branch is shown in the run header/footer, in `status`, and in the
 REPL prompt (`main>` / `(detached)>`). Use `--verbose` for full tool results and
 interim assistant text, or `--quiet` to suppress the progress stream entirely.
 
-### Safety flags
+### Security
 
-- `--workdir DIR` — override the working directory (default `<workspace>/work`).
+- `--sandbox` — run every command inside a **network-less, read-only-root**
+  sandbox via bwrap (bubblewrap) or firejail: no outbound network, root and
+  `$HOME` are read-only, only the working directory is writable, and `/tmp` is
+  ephemeral. **Fails closed** (with a clear error) if neither backend is
+  installed.
+- **Environment scrubbing** — child commands only receive a curated allowlist
+  of environment variables, so `LLM_API_KEY` / `AWS_*` / tokens never leak via
+  `env`. Add more with `--env-allow VAR1,VAR2`.
+- **Secret redaction** — command output and file content are redacted before
+  reaching the model or the session log (PEM private keys, `sk-…` keys, AWS
+  keys, `Bearer …`, quoted `api_key="…"` assignments). Conservative, so
+  ordinary source code is not mangled.
+- **Tool allowlist + validation** — the model's tool calls dispatch through an
+  explicit name→function map (never `getattr` on model input) and arguments are
+  validated against each tool's JSON schema (unknown/missing/wrong-typed
+  arguments are rejected).
 - `--allow-outside-workdir` — let file tools touch paths outside `workdir`.
 - `--allow-dangerous-commands` — allow the blocked destructive-command patterns
   (`rm -rf /`, `mkfs`, fork bombs, …).
 
-> `run_command` executes with your user privileges. The danger-pattern
-> blocklist is a best-effort guardrail, **not** a security boundary — run the
-> agent in a container for untrusted work.
+`--workdir DIR` overrides the working directory (default `<workspace>/work`).
+
+> These are best-effort, defense-in-depth measures. The only real security
+> boundary is a dedicated OS-level sandbox (container / VM) — run the agent
+> inside one for untrusted work.
 
 ## Cache-friendly context management
 
@@ -192,7 +211,9 @@ coding_agent/
 ├── config.py   # defaults ← project config ← workspace config ← env ← CLI
 ├── llm.py      # OpenAI-compatible HTTP client, retry, response parsing
 ├── tools.py    # tool JSON schemas + local executors + safety guards
+├── security.py # sandbox, env scrubbing, secret redaction
 ├── store.py    # workspace/session/branch/HEAD store (git-like DAG)
+├── graph.py    # git-log --graph style DAG rendering
 ├── agent.py    # the loop + context compaction/trimming + termination
 └── __main__.py # python -m coding_agent
 ```
@@ -215,7 +236,7 @@ endpoint:
 python -m unittest discover -s tests -v
 ```
 
-71 tests cover every tool executor, config precedence, LLM parsing/retry, the
+90 tests cover every tool executor, config precedence, LLM parsing/retry, the
 full agent loop end-to-end, context compaction, the session/branch store (DAG,
 guards, artifacts), DAG graph rendering, and the CLI run/REPL flow.
 

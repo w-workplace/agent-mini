@@ -38,6 +38,8 @@ DEFAULTS: dict[str, Any] = {
     "allow_dangerous_commands": False,
     "command_timeout": 120.0,
     "compact": False,  # summarize oldest turns instead of dropping them
+    "sandbox": False,  # run commands in a network-less, read-only-root sandbox
+    "env_allow": "",   # extra (comma-separated) env vars to pass to commands
     "verbose": False,
     "quiet": False,  # suppress progress output
     "system_prompt": "",
@@ -48,6 +50,7 @@ _ENV_KEYS: dict[str, tuple[str, ...]] = {
     "base_url": ("LLM_BASE_URL", "OPENAI_BASE_URL", "OPENAI_API_BASE"),
     "api_key": ("LLM_API_KEY", "OPENAI_API_KEY"),
     "model": ("LLM_MODEL", "OPENAI_MODEL"),
+    "env_allow": ("LLM_ENV_ALLOW",),
 }
 
 # Numeric environment variables (``LLM_<UPPER_NAME>``).
@@ -70,6 +73,7 @@ _BOOLEAN_CASTERS: dict[str, Callable[[str], bool]] = {
     "allow_outside_workdir": _parse_bool,
     "allow_dangerous_commands": _parse_bool,
     "compact": _parse_bool,
+    "sandbox": _parse_bool,
     "verbose": _parse_bool,
     "quiet": _parse_bool,
 }
@@ -92,6 +96,8 @@ class Config:
     allow_dangerous_commands: bool = False
     command_timeout: float = DEFAULTS["command_timeout"]
     compact: bool = False
+    sandbox: bool = False
+    env_allow: str = ""
     verbose: bool = False
     quiet: bool = False
     system_prompt: str = ""

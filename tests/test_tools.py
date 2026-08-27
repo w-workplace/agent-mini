@@ -126,6 +126,33 @@ class ToolRunnerTestCase(unittest.TestCase):
         self.assertFalse(res["ok"])
         self.assertIn("unknown tool", res["error"])
 
+    def test_dunder_tool_blocked(self):
+        # Model-provided names can never reach arbitrary methods.
+        res = self.runner.execute("__init__", {})
+        self.assertFalse(res["ok"])
+        self.assertIn("unknown tool", res["error"])
+
+    def test_unknown_argument_rejected(self):
+        res = self.runner.execute("read_file", {"path": "a.txt", "bogus": 1})
+        self.assertFalse(res["ok"])
+        self.assertIn("unknown argument", res["error"])
+
+    def test_missing_required_argument(self):
+        res = self.runner.execute("read_file", {})
+        self.assertFalse(res["ok"])
+        self.assertIn("missing required argument", res["error"])
+
+    def test_wrong_type_argument(self):
+        res = self.runner.execute("read_file", {"path": 123})
+        self.assertFalse(res["ok"])
+        self.assertIn("must be a string", res["error"])
+
+    def test_tool_result_is_redacted(self):
+        from coding_agent.tools import format_tool_result
+        out = format_tool_result({"ok": True, "stdout": "key=sk-abc1234567890"})
+        self.assertNotIn("sk-abc1234567890", out)
+        self.assertIn("REDACTED", out)
+
 
 if __name__ == "__main__":
     unittest.main()

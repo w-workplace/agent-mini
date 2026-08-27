@@ -17,7 +17,7 @@ from .llm import LLMClient, LLMError
 from .store import SessionStore, StoreError
 from .tools import TOOL_SCHEMAS, ToolRunner
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 __all__ = [
     "Agent",

@@ -18,6 +18,8 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+from .security import build_sandbox_argv, command_env, detect_sandbox_backend, redact_obj
+
 # ---------------------------------------------------------------------------
 # Output limits (keep tool results bounded so they don't blow up the context).
 # ---------------------------------------------------------------------------
@@ -191,6 +193,13 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
 ]
 
 
+# The set of tool names the model may invoke. ``execute`` only ever dispatches
+# to these, via an explicit name -> method map (no `getattr` on model input).
+_EXECUTOR_NAMES = frozenset({
+    "list_files", "read_file", "write_file", "edit_file", "grep", "run_command",
+})
+
+
 class ToolRunner:
     """Executes tool calls locally, scoped to a working directory."""
 
@@ -200,11 +209,19 @@ class ToolRunner:
         allow_outside_workdir: bool = False,
         allow_dangerous_commands: bool = False,
         command_timeout: float = 120.0,
+        sandbox: bool = False,
+        env_allow: str = "",
     ):
         self.workdir = Path(workdir).resolve()
         self.allow_outside_workdir = allow_outside_workdir
         self.allow_dangerous_commands = allow_dangerous_commands
         self.command_timeout = command_timeout
+        self.sandbox = sandbox
+        self.env_allow = env_allow
+        self.sandbox_backend = detect_sandbox_backend() if sandbox else None
+        # Explicit allowlist: only these callables are reachable from the model.
+        self._executors = {name: getattr(self, name) for name in _EXECUTOR_NAMES}
+        self._schemas = {s["function"]["name"]: s["function"] for s in TOOL_SCHEMAS}
 
     # -- helpers ------------------------------------------------------------
     @staticmethod
@@ -392,18 +409,33 @@ class ToolRunner:
                 "command matches a blocked dangerous-command pattern; "
                 "if this is intended, run the agent with --allow-dangerous-commands"
             )
+        if self.sandbox and not self.sandbox_backend:
+            return self._err(
+                "sandbox requested but neither bwrap nor firejail is available; "
+                "install one or drop --sandbox"
+            )
         if timeout is None:
             limit = self.command_timeout
         else:
             limit = min(float(timeout), self.command_timeout)
+
+        # Scrub the environment: never pass API keys/tokens to child commands.
+        env = command_env(str(self.workdir), sandbox=self.sandbox, extra_allow=self.env_allow)
+
+        if self.sandbox:
+            argv = build_sandbox_argv(self.sandbox_backend, str(self.workdir), command)
+            run_kwargs = dict(args=argv, shell=False)
+        else:
+            run_kwargs = dict(args=command, shell=True)
+
         try:
             proc = subprocess.run(
-                command,
-                shell=True,
                 cwd=str(self.workdir),
                 capture_output=True,
                 text=True,
                 timeout=limit,
+                env=env,
+                **run_kwargs,
             )
         except subprocess.TimeoutExpired:
             return self._err(f"command timed out after {limit}s")
@@ -428,14 +460,50 @@ class ToolRunner:
         return any(re.search(pat, cmd) for pat in DANGEROUS_PATTERNS)
 
     # -- dispatch ------------------------------------------------------------
+    def _validate_arguments(self, name: str, arguments: Any) -> str | None:
+        """Validate a tool call's arguments against its declared JSON schema.
+
+        Returns an error message, or ``None`` if valid. This treats model
+        output as untrusted input (defense against tool confusion / injection).
+        """
+        schema = self._schemas.get(name)
+        if schema is None:
+            return f"unknown tool: {name}"
+        if not isinstance(arguments, dict):
+            return f"arguments for {name} must be a JSON object"
+        props = schema.get("parameters", {}).get("properties", {})
+        required = schema.get("parameters", {}).get("required", [])
+
+        for key in arguments:
+            if key not in props:
+                return f"{name}: unknown argument {key!r}"
+        for key in required:
+            if arguments.get(key) is None:
+                return f"{name}: missing required argument {key!r}"
+
+        for key, value in arguments.items():
+            if value is None:
+                continue
+            expected = props[key].get("type")
+            if expected == "string" and not isinstance(value, str):
+                return f"{name}: argument {key!r} must be a string"
+            if expected == "integer" and (not isinstance(value, int) or isinstance(value, bool)):
+                return f"{name}: argument {key!r} must be an integer"
+            if expected == "number" and (not isinstance(value, (int, float)) or isinstance(value, bool)):
+                return f"{name}: argument {key!r} must be a number"
+            if expected == "boolean" and not isinstance(value, bool):
+                return f"{name}: argument {key!r} must be a boolean"
+        return None
+
     def execute(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        fn = getattr(self, name, None)
-        if fn is None or name.startswith("_") or not callable(fn):
+        fn = self._executors.get(name)
+        if fn is None:
             return self._err(f"unknown tool: {name}")
+        error = self._validate_arguments(name, arguments)
+        if error is not None:
+            return self._err(error)
         try:
             result = fn(**arguments)
-        except TypeError as exc:
-            return self._err(f"bad arguments for {name}: {exc}")
         except ToolError as exc:
             return self._err(str(exc))
         except Exception as exc:  # noqa: BLE001 — last line of defense
@@ -446,5 +514,9 @@ class ToolRunner:
 
 
 def format_tool_result(result: dict[str, Any]) -> str:
-    """Serialize a tool result into the string fed back to the model."""
-    return json.dumps(result, ensure_ascii=False)
+    """Serialize a tool result into the string fed back to the model.
+
+    Secret-looking content is redacted before serialization, so it neither
+    reaches the model nor lands (unredacted) in the session log.
+    """
+    return json.dumps(redact_obj(result), ensure_ascii=False)

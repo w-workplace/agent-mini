@@ -30,6 +30,7 @@ from . import __version__
 from .agent import Agent, AgentError
 from .config import load_config
 from .llm import LLMClient
+from .security import detect_sandbox_backend
 from .store import SessionStore, StoreError
 from .tools import TOOL_SCHEMAS, ToolRunner
 
@@ -70,6 +71,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--workdir", help="Working directory for the agent (default: <workspace>/work).")
     p.add_argument("--system-prompt", help="Override the default system prompt.")
     p.add_argument("--command-timeout", type=float, help="Max seconds per command (default 120).")
+    p.add_argument("--sandbox", action="store_true",
+                   help="Run commands in a network-less, read-only-root sandbox (bwrap/firejail).")
+    p.add_argument("--env-allow", help="Extra env vars (comma-separated) to pass through to commands.")
     p.add_argument("--compact", action="store_true",
                    help="Summarize oldest turns when context overflows (cache-friendly).")
     p.add_argument("--allow-outside-workdir", action="store_true",
@@ -89,12 +93,12 @@ def _cli_overrides(opts: argparse.Namespace) -> dict[str, Any]:
     for key in (
         "model", "base_url", "api_key", "max_iterations", "max_tokens",
         "temperature", "context_limit_tokens", "workdir", "system_prompt",
-        "command_timeout", "workspace",
+        "command_timeout", "workspace", "env_allow",
     ):
         value = getattr(opts, key, None)
         if value is not None:
             overrides[key] = value
-    for flag in ("allow_outside_workdir", "allow_dangerous_commands", "verbose", "compact", "quiet"):
+    for flag in ("allow_outside_workdir", "allow_dangerous_commands", "verbose", "compact", "quiet", "sandbox"):
         if getattr(opts, flag, False):
             overrides[flag] = True
     return overrides
@@ -116,6 +120,8 @@ def _build_agent(config: Any, workdir: str, history: list[dict[str, Any]] | None
         allow_outside_workdir=config.allow_outside_workdir,
         allow_dangerous_commands=config.allow_dangerous_commands,
         command_timeout=config.command_timeout,
+        sandbox=config.sandbox,
+        env_allow=config.env_allow,
     )
     return Agent(config, llm=llm, tools=tools, history=history)
 
@@ -170,6 +176,18 @@ def _no_api_key() -> None:
         "the environment, or put it in the workspace config.json — see README.md.",
         file=sys.stderr,
     )
+
+
+def _check_sandbox(config: Any) -> bool:
+    """Fail closed if --sandbox was requested but no backend is available."""
+    if config.sandbox and detect_sandbox_backend() is None:
+        print(
+            "error: --sandbox requires bwrap (bubblewrap) or firejail, "
+            "neither was found; install one or drop --sandbox",
+            file=sys.stderr,
+        )
+        return False
+    return True
 
 
 def _status(store: SessionStore) -> int:
@@ -376,6 +394,8 @@ def _dispatch(opts: argparse.Namespace, cmd: str, cmd_args: list[str]) -> int:
     config = load_config(_cli_overrides(opts))
 
     if cmd == "run":
+        if not _check_sandbox(config):
+            return 2
         task = " ".join(cmd_args)
         return _run(opts, config, task)
 
@@ -409,6 +429,8 @@ def _dispatch(opts: argparse.Namespace, cmd: str, cmd_args: list[str]) -> int:
     if cmd == "rm":
         return _rm(SessionStore(config.workspace), cmd_args)
     if cmd == "repl":
+        if not _check_sandbox(config):
+            return 2
         if not config.api_key:
             _no_api_key()
             return 2
