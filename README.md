@@ -204,6 +204,34 @@ use `--no-snapshot` to disable them entirely.
 > boundary is a dedicated OS-level sandbox (container / VM) — run the agent
 > inside one for untrusted work.
 
+## Performance
+
+The dominant latency in a coding-agent loop is the number of model round-trips
+and the network setup cost of each request. This build includes several
+coding-specific optimizations:
+
+- **Persistent HTTP/1.1 connections** — one keep-alive connection is kept per
+  thread across chat-completion calls, avoiding a TCP+TLS handshake on every
+  agent step while the connection stays alive.
+- **gzip responses** — `Accept-Encoding: gzip` is requested and decompressed
+  transparently, reducing transfer time for large histories/tool outputs.
+- **Parallel read-only tools** — when the model requests several
+  `list_files`/`read_file`/`grep` calls in one response, they execute
+  concurrently while preserving message order. The system prompt explicitly
+  asks the model to batch independent reads.
+- **Large-file line index** — `read_file` builds a cached byte-offset index for
+  files up to 64 MiB, so paging a big file repeatedly is O(page) rather than
+  rescanning from byte zero each time.
+- **Answer-before-snapshot** — non-streaming runs print the final answer before
+  the (potentially slow) workspace artifact snapshot.
+- **Bounded tool output** — list/read/grep/command results are capped, keeping
+  request payloads and model prefill time from growing without bound.
+
+For maximum scripted throughput use `--minimal` (or `--quiet --no-stream`), a
+lower `--context-limit-tokens`, and `--max-iterations` no larger than needed.
+For large repositories, installing `ripgrep` is recommended; a future fast path
+can delegate `grep` to `rg` when available.
+
 ## Subagents, streaming & skills
 
 **Subagents (parallel search)** — the model can call `parallel_search` to
@@ -288,7 +316,7 @@ endpoint:
 python -m unittest discover -s tests -v
 ```
 
-124 tests cover every tool executor, config precedence, LLM parsing/streaming/retry, the
+126 tests cover every tool executor, config precedence, LLM parsing/streaming/retry, the
 full agent loop end-to-end, context compaction, the session/branch store (DAG,
 guards, artifacts), DAG graph rendering, and the CLI run/REPL flow (including failed-run recovery, /save checkpoints, stdin tasks, large-file paging, and bounded command capture).
 

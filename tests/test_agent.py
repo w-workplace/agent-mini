@@ -47,6 +47,50 @@ def _scenario_create_and_verify():
     return scenario
 
 
+def _scenario_parallel_reads():
+    state = {"n": 0}
+
+    def scenario(handler, body):
+        n = state["n"]
+        state["n"] += 1
+        if n == 0:
+            return {
+                "id": "chatcmpl-fake",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "fake-model",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "c0",
+                                "type": "function",
+                                "function": {
+                                    "name": "read_file",
+                                    "arguments": '{"path": "a.txt"}',
+                                },
+                            },
+                            {
+                                "id": "c1",
+                                "type": "function",
+                                "function": {
+                                    "name": "read_file",
+                                    "arguments": '{"path": "b.txt"}',
+                                },
+                            },
+                        ],
+                    },
+                    "finish_reason": "tool_calls",
+                }],
+            }
+        return final_response("read both")
+
+    return scenario
+
+
 class AgentEndToEndTestCase(unittest.TestCase):
     def test_full_loop(self):
         server = FakeOpenAIServer(_scenario_create_and_verify())
@@ -95,6 +139,25 @@ class AgentEndToEndTestCase(unittest.TestCase):
                     agent.run("never finish")
             finally:
                 server.shutdown()
+
+    def test_read_only_tool_batch_runs_and_preserves_order(self):
+        server = FakeOpenAIServer(_scenario_parallel_reads())
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "a.txt").write_text("content A")
+            Path(tmp, "b.txt").write_text("content B")
+            config = Config(
+                base_url=server.base_url, api_key="k", model="m", workdir=tmp
+            )
+            agent = Agent(config)
+            try:
+                answer = agent.run("read two files")
+            finally:
+                server.shutdown()
+            self.assertEqual(answer, "read both")
+            tool_msgs = [m for m in agent.messages if m["role"] == "tool"]
+            self.assertEqual(len(tool_msgs), 2)
+            self.assertIn("content A", tool_msgs[0]["content"])
+            self.assertIn("content B", tool_msgs[1]["content"])
 
     def test_error_fed_back_to_model(self):
         """A tool that fails should return its error to the model and continue."""

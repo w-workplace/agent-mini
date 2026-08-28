@@ -24,12 +24,15 @@ from __future__ import annotations
 
 import json
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from .llm import LLMClient, LLMError
 from .security import redact
 from .skills import discover_skills, load_skills, skill_prompt
 from .tools import ToolRunner, format_tool_result
+
+_READ_ONLY_TOOLS = frozenset({"list_files", "read_file", "grep"})
 
 DEFAULT_SYSTEM_PROMPT = """\
 You are a coding agent: an autonomous software-engineering assistant.
@@ -46,6 +49,9 @@ example `src/main.py`, `tests/`) rather than absolute paths.
 Guidelines:
 - Explore first: use list_files, grep and read_file to understand the code
   before changing it.
+- Batch independent reads: when you need several unrelated files or searches,
+  request all of them in ONE response as multiple read-only tool calls; the
+  agent executes those in parallel, which is much faster than one per turn.
 - Prefer edit_file for small, targeted changes (it replaces one exact string);
   use write_file to create a new file or rewrite one entirely.
 - Verify your work: after changing code, run the project's tests/build (or
@@ -107,6 +113,7 @@ class Agent:
         if config.subagents and not getattr(self.tools, "read_only", False):
             self.tools.set_subagent_executor(self._run_subagents)
         self.tool_schemas = self.tools.tool_schemas
+        self._tool_token_estimate: int | None = None
         self.messages: list[dict[str, Any]] = []
         self._init_system_prompt()
         # Skills load on the first turn of a fresh session (not when continuing
@@ -171,8 +178,16 @@ class Agent:
                 break
 
             signature: list[tuple[str, str, str]] = []
-            for tc in reply.tool_calls:
-                result = self.tools.execute(tc.name, tc.arguments)
+            calls = reply.tool_calls
+            parallel_results: dict[int, dict[str, Any]] = {}
+            if len(calls) > 1 and all(tc.name in _READ_ONLY_TOOLS for tc in calls):
+                parallel_results = self._run_read_only_parallel(calls)
+            for idx, tc in enumerate(calls):
+                self._show_tool_start(step, tc)
+                if idx in parallel_results:
+                    result = parallel_results[idx]
+                else:
+                    result = self.tools.execute(tc.name, tc.arguments)
                 fingerprint = self._tool_result_fingerprint(result)
                 signature.append(
                     (
@@ -181,7 +196,6 @@ class Agent:
                         fingerprint,
                     )
                 )
-                self._show_tool_start(step, tc)
                 self.messages.append(
                     {
                         "role": "tool",
@@ -204,6 +218,16 @@ class Agent:
             )
 
         return final_answer
+
+    def _run_read_only_parallel(
+        self, calls: list[Any]
+    ) -> dict[int, dict[str, Any]]:
+        def run_one(item: tuple[int, Any]) -> tuple[int, dict[str, Any]]:
+            idx, tc = item
+            return idx, self.tools.execute(tc.name, tc.arguments)
+
+        with ThreadPoolExecutor(max_workers=min(8, len(calls))) as ex:
+            return dict(ex.map(run_one, enumerate(calls)))
 
     def _call_llm(self) -> Any:
         if getattr(self.config, "stream", False):
@@ -264,11 +288,17 @@ class Agent:
         return total
 
     def _estimate_tool_tokens(self) -> int:
-        """Estimate tokens consumed by the tool schemas sent with every call."""
-        schemas = json.dumps(self.tool_schemas, ensure_ascii=False)
-        # Add a modest per-request framing allowance so the estimate does not
-        # undercount the actual wire payload.
-        return max(0, len(schemas) // 4) + 32
+        """Estimate tokens consumed by the tool schemas sent with every call.
+
+        Cached: the tool set is fixed after ``Agent.__init__``, so serializing
+        the schemas on every iteration would only waste CPU.
+        """
+        if self._tool_token_estimate is None:
+            schemas = json.dumps(self.tool_schemas, ensure_ascii=False)
+            # Add a modest per-request framing allowance so the estimate does
+            # not undercount the actual wire payload.
+            self._tool_token_estimate = max(0, len(schemas) // 4) + 32
+        return self._tool_token_estimate
 
     def _manage_context(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         limit = self.config.context_limit_tokens

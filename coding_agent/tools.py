@@ -18,7 +18,8 @@ import subprocess
 import sys
 import tempfile
 import threading
-from collections import deque
+from array import array
+from collections import OrderedDict, deque
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +33,9 @@ MAX_GREP_MATCHES = 300
 MAX_GREP_FILE_BYTES = 1024 * 1024  # skip files larger than this in grep
 MAX_READ_BYTES = 256 * 1024        # full-file fast path threshold
 MAX_READ_LINES = 2000             # lines returned by read_file when paging a large file
+MAX_READ_INDEX_BYTES = 64 * 1024 * 1024  # build a line-offset index up to this size
+MAX_READ_INDEX_LINES = 2_000_000         # cap indexed lines per cached file
+MAX_READ_INDEX_FILES = 4                 # LRU size for line-offset indexes
 MAX_OUTPUT_BYTES = 50 * 1024       # stdout/stderr kept from a command
 MAX_LIVE_OUTPUT_BYTES = 256 * 1024 # live command output echoed to stderr
 MAX_GREP_LINE_LEN = 500
@@ -285,6 +289,8 @@ class ToolRunner:
         self.sandbox_backend = detect_sandbox_backend() if sandbox else None
         self._schemas = {s["function"]["name"]: s["function"] for s in TOOL_SCHEMAS}
         self._executors: dict[str, Any] = {}
+        self._line_index_cache: OrderedDict[tuple[str, int, int], array] = OrderedDict()
+        self._line_index_lock = threading.Lock()
         self._rebuild_executors()
 
     def _rebuild_executors(self) -> None:
@@ -371,7 +377,7 @@ class ToolRunner:
         if not root.is_dir():
             return self._err(f"not a directory: {path}")
         try:
-            matches = sorted(glob.glob(str(root / pattern), recursive=True))
+            matches = glob.glob(str(root / pattern), recursive=True)
         except re.error as exc:
             return self._err(f"bad glob pattern: {exc}")
         files: list[str] = []
@@ -432,6 +438,44 @@ class ToolRunner:
             )
         return self._read_large_file(p, offset, limit, size)
 
+    def _line_index(self, p: Path, size: int) -> array | None:
+        """Return (and cache) byte offsets for every line in ``p``.
+
+        Returns ``None`` for files too large to index; those fall back to
+        streaming.  Offsets are packed in an ``array('Q')`` (8 bytes/line)
+        rather than Python ints to keep the cache small.
+        """
+        if size > MAX_READ_INDEX_BYTES:
+            return None
+        try:
+            key = (str(p), size, p.stat().st_mtime_ns)
+        except OSError:
+            return None
+        with self._line_index_lock:
+            cached = self._line_index_cache.get(key)
+            if cached is not None:
+                self._line_index_cache.move_to_end(key)
+                return cached
+        offsets = array("Q")
+        try:
+            with p.open("rb") as f:
+                while True:
+                    pos = f.tell()
+                    line = f.readline()
+                    if not line:
+                        break
+                    offsets.append(pos)
+                    if len(offsets) > MAX_READ_INDEX_LINES:
+                        return None  # too many lines; stream instead
+        except OSError:
+            return None
+        with self._line_index_lock:
+            self._line_index_cache[key] = offsets
+            self._line_index_cache.move_to_end(key)
+            while len(self._line_index_cache) > MAX_READ_INDEX_FILES:
+                self._line_index_cache.popitem(last=False)
+        return offsets
+
     def _read_large_file(
         self,
         p: Path,
@@ -441,9 +485,8 @@ class ToolRunner:
     ) -> dict[str, Any]:
         """Page through files larger than MAX_READ_BYTES without loading them.
 
-        Lines are streamed and counted from the start of the file, so an
-        arbitrary 1-based ``offset`` works even past the first chunk.
-        ``limit`` is capped to keep one tool result bounded.
+        A cached byte-offset index makes repeated pages O(page size) instead
+        of rescanning the file from the beginning for every page.
         """
         start = max(1, int(offset or 1))
         if limit is None:
@@ -451,6 +494,42 @@ class ToolRunner:
         else:
             limit = max(0, min(int(limit), MAX_READ_LINES))
 
+        offsets = self._line_index(p, size)
+        if offsets is not None:
+            total = len(offsets)
+            if start > total:
+                return self._ok(
+                    path=self._display_path(p),
+                    content="",
+                    total_lines=total,
+                    lines_returned=0,
+                    truncated=True,
+                    file_bytes=size,
+                )
+            end = min(total, start + limit - 1)
+            read_start = offsets[start - 1]
+            read_end = offsets[end] if end < total else size
+            try:
+                with p.open("rb") as f:
+                    f.seek(read_start)
+                    data = f.read(read_end - read_start)
+            except OSError as exc:
+                return self._err(f"cannot read {p}: {exc}")
+            try:
+                text = data.decode("utf-8")
+            except UnicodeDecodeError:
+                text = data.decode("utf-8", "replace")
+            shown = text.splitlines()
+            return self._ok(
+                path=self._display_path(p),
+                content=self._render_lines(shown, start),
+                total_lines=total,
+                lines_returned=len(shown),
+                truncated=True,
+                file_bytes=size,
+            )
+
+        # Fallback for files too large to index: stream once from the start.
         shown: list[str] = []
         total = 0
         scanned_to_end = False

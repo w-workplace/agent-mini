@@ -225,6 +225,16 @@ def _run_task(config: Any, store: SessionStore, workdir: str, task: str, message
         error = str(exc)
         answer = ""
 
+    # Emit the result before the (potentially slow) artifact snapshot so
+    # non-streaming callers see the answer as soon as the model is done.
+    if error:
+        print(f"error: {error}", file=sys.stderr)
+    elif getattr(config, "stream", False):
+        if answer and not answer.endswith("\n"):
+            print()
+    else:
+        print(answer)
+
     try:
         with store.locked():
             sid = _seal_session(
@@ -235,14 +245,6 @@ def _run_task(config: Any, store: SessionStore, workdir: str, task: str, message
         print(f"error: could not save session: {exc}", file=sys.stderr)
         return 1
 
-    if error:
-        print(f"error: {error}", file=sys.stderr)
-    elif getattr(config, "stream", False):
-        # The answer was already streamed to stdout; just terminate the line.
-        if answer and not answer.endswith("\n"):
-            print()
-    else:
-        print(answer)
     if not getattr(config, "quiet", False):
         status = "failed" if error else ""
         print(

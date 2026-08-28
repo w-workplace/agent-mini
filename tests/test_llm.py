@@ -1,6 +1,9 @@
 """Tests for the LLM client: response parsing, streaming, and retry."""
 
+import json
+import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest import mock
 
 from coding_agent.llm import AssistantMessage, LLMClient, LLMError
@@ -144,7 +147,7 @@ class StreamingTestCase(unittest.TestCase):
         ]
         client = LLMClient("https://x/v1", "k", "m")
         got = []
-        with mock.patch("coding_agent.llm.urllib.request.urlopen", return_value=_FakeResponse(lines)):
+        with mock.patch.object(client, "_open", return_value=_FakeResponse(lines)):
             msg = client.chat_stream([{"role": "user", "content": "hi"}], on_text=got.append)
         self.assertEqual(msg.content, "Hello world")
         self.assertEqual("".join(got), "Hello world")
@@ -153,7 +156,7 @@ class StreamingTestCase(unittest.TestCase):
         body = b'{"choices":[{"index":0,"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}]}'
         client = LLMClient("https://x/v1", "k", "m")
         got = []
-        with mock.patch("coding_agent.llm.urllib.request.urlopen", return_value=_FakeResponse([body])):
+        with mock.patch.object(client, "_open", return_value=_FakeResponse([body])):
             msg = client.chat_stream([{"role": "user", "content": "hi"}], on_text=got.append)
         self.assertEqual(msg.content, "done")
         self.assertEqual(got, ["done"])
@@ -161,10 +164,7 @@ class StreamingTestCase(unittest.TestCase):
 
     def test_chat_stream_non_streaming_fallback_invalid_json(self):
         client = LLMClient("https://x/v1", "k", "m")
-        with mock.patch(
-            "coding_agent.llm.urllib.request.urlopen",
-            return_value=_FakeResponse([b"not-json"]),
-        ):
+        with mock.patch.object(client, "_open", return_value=_FakeResponse([b"not-json"])):
             with self.assertRaises(LLMError):
                 client.chat_stream([{"role": "user", "content": "hi"}])
 
@@ -174,6 +174,48 @@ class StreamingTestCase(unittest.TestCase):
         )
         req = client._build_request({"model": "m", "messages": []})
         self.assertEqual(req.get_header("X-trace"), "abc")
+
+
+class PersistentConnectionTestCase(unittest.TestCase):
+    def test_chat_reuses_http_connection(self):
+        connections = []
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_POST(self):
+                connections.append(id(self.connection))
+                length = int(self.headers.get("Content-Length", "0"))
+                self.rfile.read(length)
+                body = json.dumps({
+                    "choices": [{
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop",
+                    }]
+                }).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        client = LLMClient(
+            f"http://127.0.0.1:{server.server_address[1]}/v1", "k", "m"
+        )
+        try:
+            for _ in range(3):
+                self.assertEqual(client.chat([{"role": "user", "content": "x"}]).content, "ok")
+            self.assertEqual(len(set(connections)), 1)
+        finally:
+            client._discard_connection()
+            server.shutdown()
+            server.server_close()
 
 
 if __name__ == "__main__":
