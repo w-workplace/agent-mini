@@ -159,5 +159,22 @@ class StreamingTestCase(unittest.TestCase):
         self.assertEqual(got, ["done"])
 
 
+    def test_chat_stream_non_streaming_fallback_invalid_json(self):
+        client = LLMClient("https://x/v1", "k", "m")
+        with mock.patch(
+            "coding_agent.llm.urllib.request.urlopen",
+            return_value=_FakeResponse([b"not-json"]),
+        ):
+            with self.assertRaises(LLMError):
+                client.chat_stream([{"role": "user", "content": "hi"}])
+
+    def test_extra_headers_are_sent(self):
+        client = LLMClient(
+            "https://x/v1", "k", "m", extra_headers={"X-Trace": "abc"}
+        )
+        req = client._build_request({"model": "m", "messages": []})
+        self.assertEqual(req.get_header("X-trace"), "abc")
+
+
 if __name__ == "__main__":
     unittest.main()

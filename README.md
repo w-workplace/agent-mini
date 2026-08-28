@@ -16,7 +16,7 @@ $ python -m coding_agent "Add a --verbose flag to the CLI and a unit test for it
 
 ```
 created ...
-[session 6f5a3c21]
+[session 6f5a3c21a9b04d7e]
 ```
 
 Every run is recorded as an immutable **session** (a git-like "commit"), stored
@@ -93,10 +93,10 @@ memorable:
 
 ```console
 coding-agent "task"              # run a task (new session)          [= run]
-coding-agent run "task" [-M msg] # explicit
+coding-agent run "task" [-M msg] # explicit; `run` with no args reads stdin
 coding-agent status              # workspace / branch / HEAD
 coding-agent log [--all] [--graph] [--oneline]   # session history (DAG)
-coding-agent show <ref>          # view a session's conversation
+coding-agent show <ref> [--all]  # view a session's conversation (last 20 msgs)
 coding-agent switch <ref>        # roll back HEAD (no file changes)
 coding-agent checkout <ref>      # roll back HEAD + restore work/ files
 coding-agent branch [<name>]     # list / create a branch
@@ -106,12 +106,20 @@ coding-agent repl                # interactive (turns merge into ONE session)
 coding-agent init                # initialize the workspace
 ```
 
+```console
+printf 'add a README section about testing' | coding-agent run
+```
+
 - `<ref>` is a branch name or a session id (full or unique prefix).
 - `switch`/`checkout` roll HEAD back (like `git switch`/`git checkout`).
 - `log --graph` renders the session DAG like `git log --graph` (`*` commits,
   `|` lines, `/` `\` forks/merges), with branch/HEAD markers.
 - `repl` merges every turn into **one** session (sealed when you exit), rather
-  than recording a session per turn.
+  than recording a session per turn. `/save` inside the REPL seals a
+  checkpoint session and continues from it.
+- A failed run (LLM error, `max_iterations`, repeat guard) is still sealed as
+  a session with `status: "failed"` and the error recorded in `meta.json`, so
+  the partial workdir/conversation is never lost.
 - Guards keep the DAG safe: you can't delete the current session, a branch
   tip, or a session that other sessions descend from.
 - `checkout <ref>` also restores `work/` from that session's artifact snapshot
@@ -136,9 +144,14 @@ local server (vLLM / llama.cpp). Credentials go in an environment variable or
 the untracked workspace `config.json`; never commit them.
 
 Key options (env `LLM_<UPPER>` / CLI): `max_iterations`, `context_limit_tokens`,
-`compact`, `max_tokens`, `temperature`, `command_timeout`, `sandbox`,
+`compact`, `max_tokens`, `temperature`, `timeout`, `command_timeout`, `sandbox`,
 `env_allow`, `subagents`, `subagent_parallel`, `stream`, `skills`, `max_skills`,
-`allow_outside_workdir`, `allow_dangerous_commands`, `verbose`, `quiet`.
+`snapshot`, `allow_outside_workdir`, `allow_dangerous_commands`, `verbose`,
+`quiet`, `minimal`. All boolean flags accept both forms, e.g. `--sandbox` /
+`--no-sandbox`, `--stream` / `--no-stream`. Additional model-API HTTP headers
+can be set with repeated `--header 'Name: value'` flags, the
+`LLM_EXTRA_HEADERS` environment variable, or the `extra_headers` JSON object
+in a config file.
 
 ### Progress & branch display
 
@@ -153,7 +166,7 @@ answer stays on stdout for scripting):
   ok (bytes_written=6)
 [step 3/40] run_command("cat greeting.txt")
   ok (exit_code=0)
-[session 530576fc] on branch main
+[session 530576fc9b04d7e2] on branch main
 ```
 
 The current branch is shown in the run header/footer, in `status`, and in the
@@ -170,10 +183,11 @@ interim assistant text, or `--quiet` to suppress the progress stream entirely.
 - **Environment scrubbing** — child commands only receive a curated allowlist
   of environment variables, so `LLM_API_KEY` / `AWS_*` / tokens never leak via
   `env`. Add more with `--env-allow VAR1,VAR2`.
-- **Secret redaction** — command output and file content are redacted before
-  reaching the model or the session log (PEM private keys, `sk-…` keys, AWS
-  keys, `Bearer …`, quoted `api_key="…"` assignments). Conservative, so
-  ordinary source code is not mangled.
+- **Secret redaction** — user task text, command output and file content are
+  redacted before reaching the model or the session log (PEM private keys,
+  `sk-…` keys, AWS keys, `Bearer …`, quoted `api_key="…"` assignments).
+  Conservative, so ordinary source code is not mangled. Tool results report
+  paths relative to the working directory, keeping local layout out of logs.
 - **Tool allowlist + validation** — the model's tool calls dispatch through an
   explicit name→function map (never `getattr` on model input) and arguments are
   validated against each tool's JSON schema (unknown/missing/wrong-typed
@@ -183,6 +197,8 @@ interim assistant text, or `--quiet` to suppress the progress stream entirely.
   (`rm -rf /`, `mkfs`, fork bombs, …).
 
 `--workdir DIR` overrides the working directory (default `<workspace>/work`).
+Artifact snapshots are only taken for the default workspace `work/` directory;
+use `--no-snapshot` to disable them entirely.
 
 > These are best-effort, defense-in-depth measures. The only real security
 > boundary is a dedicated OS-level sandbox (container / VM) — run the agent
@@ -258,7 +274,8 @@ coding_agent/
 1. Append the user's task to the (parent-session-seeded) message history.
 2. Manage context: compact or trim if over the token budget.
 3. Call the model with the conversation + `TOOL_SCHEMAS`.
-4. Parse the reply; no `tool_calls` → final answer, stop.
+4. Parse the reply; no `tool_calls` → final answer, stop (a
+   `finish_reason="tool_calls"` with no calls is treated as an error).
 5. Otherwise execute every requested tool locally and feed results back.
 6. Repeat until a final answer, `max_iterations`, or the repeat-detection guard.
 
@@ -271,15 +288,20 @@ endpoint:
 python -m unittest discover -s tests -v
 ```
 
-105 tests cover every tool executor, config precedence, LLM parsing/streaming/retry, the
+124 tests cover every tool executor, config precedence, LLM parsing/streaming/retry, the
 full agent loop end-to-end, context compaction, the session/branch store (DAG,
-guards, artifacts), DAG graph rendering, and the CLI run/REPL flow.
+guards, artifacts), DAG graph rendering, and the CLI run/REPL flow (including failed-run recovery, /save checkpoints, stdin tasks, large-file paging, and bounded command capture).
 
 ## Limitations / ideas
 
-- No vision, MCP, sub-agents, or streaming output; no OS-level sandbox for
-  `run_command`.
-- Token estimation is a rough ~4 chars/token heuristic.
-- Artifact snapshots copy the working directory (skipping VCS/build dirs,
-  capped at 100 MiB) rather than diffing; for large external projects prefer
-  `--workdir` with care, since `checkout` only restores `work/`.
+- No vision, MCP, or multi-agent orchestration beyond the built-in read-only
+  `parallel_search` subagents.
+- Token estimation is a rough ~4 chars/token heuristic (tool schemas and a
+  framing allowance are included in the budget).
+- Artifact snapshots copy the workspace `work/` directory (skipping VCS/build
+  dirs, symlinks, capped at 5000 files / 100 MiB) rather than diffing; custom
+  external `--workdir` projects are not snapshotted.
+- Context trimming/compaction uses heuristic turn boundaries, not a real
+  tokenizer; very long single messages may still exceed a provider's limit.
+- The session store uses atomic file replacement and a workspace file lock,
+  but is not a multi-user/concurrent-transaction database.

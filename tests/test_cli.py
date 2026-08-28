@@ -101,5 +101,76 @@ class CLIRunTestCase(unittest.TestCase):
             self.assertEqual(main(["--workspace", ws, "log", "--graph"]), 0)
 
 
+    def test_show_bad_ref_is_friendly(self):
+        with tempfile.TemporaryDirectory() as ws:
+            rc = main(["--workspace", ws, "show", "does-not-exist"])
+        self.assertEqual(rc, 1)
+
+    def test_run_reads_task_from_stdin(self):
+        server = FakeOpenAIServer(lambda handler, body: final_response("ok"))
+        with tempfile.TemporaryDirectory() as ws:
+            with mock.patch("sys.stdin", create=True) as fake_stdin:
+                fake_stdin.isatty.return_value = False
+                fake_stdin.read.return_value = "task from stdin"
+                try:
+                    rc = main([
+                        "--workspace", ws, "--base-url", server.base_url,
+                        "--api-key", "k", "--model", "m", "run",
+                    ])
+                finally:
+                    server.shutdown()
+            self.assertEqual(rc, 0)
+            store = SessionStore(ws)
+            conv = store.load_conversation(store.resolve_head())
+            self.assertEqual(conv[0]["content"], "task from stdin")
+
+    def test_failed_run_is_recorded_as_failed_session(self):
+        state = {"n": 0}
+
+        def never_finishes(handler, body):
+            state["n"] += 1
+            return tool_call_response(
+                "list_files", {"pattern": f"p{state['n']}"}, f"c{state['n']}"
+            )
+
+        server = FakeOpenAIServer(never_finishes)
+        with tempfile.TemporaryDirectory() as ws:
+            try:
+                rc = main([
+                    "--workspace", ws, "--base-url", server.base_url,
+                    "--api-key", "k", "--model", "m",
+                    "--max-iterations", "2", "run", "never finish",
+                ])
+            finally:
+                server.shutdown()
+            self.assertEqual(rc, 1)
+            store = SessionStore(ws)
+            meta = store.load_meta(store.resolve_head())
+            self.assertEqual(meta["status"], "failed")
+            self.assertIn("max_iterations", meta["error"])
+
+    def test_repl_save_checkpoints_and_continues(self):
+        server = FakeOpenAIServer(lambda handler, body: final_response("ok"))
+        with tempfile.TemporaryDirectory() as ws:
+            with mock.patch("builtins.input", side_effect=[
+                "first task", "/save", "second task", "/exit"
+            ]):
+                try:
+                    rc = main([
+                        "--workspace", ws, "--base-url", server.base_url,
+                        "--api-key", "k", "--model", "m", "repl",
+                    ])
+                finally:
+                    server.shutdown()
+            self.assertEqual(rc, 0)
+            store = SessionStore(ws)
+            sessions = store.list_sessions()
+            self.assertEqual(len(sessions), 2)
+            parent = sessions[0]["id"]
+            child = sessions[1]["id"]
+            self.assertEqual(sessions[1]["parent"], parent)
+            self.assertEqual(store.resolve_head(), child)
+
+
 if __name__ == "__main__":
     unittest.main()

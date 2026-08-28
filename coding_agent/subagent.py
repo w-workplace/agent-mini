@@ -25,6 +25,7 @@ report what you found.
 """
 
 MAX_SUBAGENT_QUERIES = 16
+MAX_SUBAGENT_SUMMARY_CHARS = 4000
 
 
 def run_subagents(
@@ -38,6 +39,7 @@ def run_subagents(
     sub_config = config.with_overrides(
         system_prompt=SUBAGENT_SYSTEM_PROMPT,
         subagents=False,  # subagents cannot spawn subagents
+        skills=False,  # skill instructions are for the main coding agent
         stream=False,  # summaries are returned, not streamed to stdout
         max_iterations=min(config.max_iterations, 12),
         context_limit_tokens=min(config.context_limit_tokens, 16000),
@@ -52,12 +54,19 @@ def run_subagents(
         )
         agent = Agent(sub_config, llm=llm, tools=tools)
         try:
-            return {"query": query, "summary": agent.run(query)}
+            summary = agent.run(query)
+            if len(summary) > MAX_SUBAGENT_SUMMARY_CHARS:
+                summary = (
+                    summary[:MAX_SUBAGENT_SUMMARY_CHARS]
+                    + "\n[summary truncated]"
+                )
+            return {"query": query, "summary": summary}
         except AgentError as exc:
             return {"query": query, "error": str(exc)}
 
     queries = list(queries)[:MAX_SUBAGENT_QUERIES]
-    if max_parallel <= 1:
+    max_parallel = max(1, int(max_parallel))
+    if max_parallel == 1:
         return [run_one(q) for q in queries]
     with ThreadPoolExecutor(max_workers=max_parallel) as ex:
         return list(ex.map(run_one, queries))

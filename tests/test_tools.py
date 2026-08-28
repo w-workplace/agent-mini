@@ -154,5 +154,32 @@ class ToolRunnerTestCase(unittest.TestCase):
         self.assertIn("REDACTED", out)
 
 
+    def test_read_large_file_offsets_past_first_chunk(self):
+        # Regression: offset/limit must work beyond the first MAX_READ_BYTES.
+        self.runner.write_file(
+            "big.txt", "".join(f"line {i}\n" for i in range(40000))
+        )
+        res = self.runner.read_file("big.txt", offset=4000, limit=5)
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["lines_returned"], 5)
+        self.assertIn("4000\tline 3999", res["content"])
+        self.assertTrue(res["truncated"])
+
+    def test_large_file_path_is_relative(self):
+        self.runner.write_file("sub/f.txt", "hello\n")
+        res = self.runner.read_file("sub/f.txt")
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["path"], "sub/f.txt")
+
+    def test_run_command_captures_bounded_tail(self):
+        runner = ToolRunner(workdir=self._tmp.name, stream=False)
+        res = runner.run_command(
+            "python -c \"import sys; sys.stdout.write('a'*200000)\""
+        )
+        self.assertTrue(res["ok"])
+        self.assertLessEqual(len(res["stdout"]), 50 * 1024)
+        self.assertTrue(res.get("truncated"))
+
+
 if __name__ == "__main__":
     unittest.main()

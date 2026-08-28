@@ -209,6 +209,40 @@ class AgentUnitTestCase(unittest.TestCase):
         self.assertIn("D", buf.getvalue())
 
 
+    def test_trim_keeps_latest_turn_even_when_over_budget(self):
+        agent = self._agent(context_limit_tokens=10)
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "old " + "x" * 200},
+            {"role": "user", "content": "current " + "y" * 200},
+        ]
+        trimmed = agent._trim_context(messages)
+        self.assertEqual(trimmed[-1]["content"], "current " + "y" * 200)
+
+    def test_user_task_secrets_are_redacted_before_sending(self):
+        config = Config(
+            api_key="k", model="m", stream=False, subagents=False, skills=False
+        )
+        agent = Agent(config)
+        agent.llm = _StubLLMWithFinishReason("stop")
+        agent.run("configure api_key='sk-abc1234567890' for me")
+        self.assertNotIn("sk-abc1234567890", agent.messages[1]["content"])
+        self.assertIn("REDACTED", agent.messages[1]["content"])
+
+    def test_tool_calls_finish_reason_without_calls_is_error(self):
+        config = Config(api_key="k", model="m", stream=False, subagents=False)
+        agent = Agent(config)
+        agent.llm = _StubLLMWithFinishReason("tool_calls")
+        with self.assertRaises(AgentError):
+            agent.run("task")
+
+    def test_is_stuck_ignores_different_results(self):
+        a = (("grep", "{}", "result-a"),)
+        b = (("grep", "{}", "result-b"),)
+        self.assertFalse(Agent._is_stuck([a, b, a]))
+        self.assertTrue(Agent._is_stuck([a, a, a]))
+
+
 class _FakeSummarizerLLM:
     def chat(self, messages, tools=None):
         if tools is None:
@@ -236,6 +270,15 @@ class CompactionTestCase(unittest.TestCase):
         # the summary sits immediately after system (stable prefix)
         self.assertEqual(out[1]["role"], "user")
         self.assertLessEqual(agent._estimate_tokens(out), 500)
+
+
+
+class _StubLLMWithFinishReason:
+    def __init__(self, finish_reason):
+        self.finish_reason = finish_reason
+
+    def chat(self, messages, tools=None):
+        return AssistantMessage(content=None, finish_reason=self.finish_reason)
 
 
 if __name__ == "__main__":

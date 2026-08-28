@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from coding_agent.config import Config, load_config
+from coding_agent.config import Config, load_config, parse_headers, validate_config
 
 
 class ConfigTestCase(unittest.TestCase):
@@ -96,6 +96,24 @@ class ConfigTestCase(unittest.TestCase):
         cfg = Config().with_overrides(model="new", temperature=None)
         self.assertEqual(cfg.model, "new")
         self.assertEqual(cfg.temperature, Config().temperature)
+
+
+    def test_parse_headers(self):
+        self.assertEqual(
+            parse_headers("X-Trace: abc, Authorization: Bearer t"),
+            {"X-Trace": "abc", "Authorization": "Bearer t"},
+        )
+
+    def test_validate_config_catches_conflicts_and_bad_values(self):
+        self.assertEqual(validate_config(Config(verbose=True, quiet=True)), [
+            "--verbose and --quiet cannot be used together"
+        ])
+        self.assertTrue(
+            any("max_iterations" in e for e in validate_config(Config(max_iterations=-1)))
+        )
+        self.assertTrue(
+            any("subagent_parallel" in e for e in validate_config(Config(subagent_parallel=0)))
+        )
 
 
 if __name__ == "__main__":

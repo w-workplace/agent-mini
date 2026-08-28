@@ -159,5 +159,42 @@ class SessionStoreTestCase(unittest.TestCase):
         self.assertEqual((work / "sub" / "nested.py").read_text(), "x=1")
 
 
+    def test_session_id_is_16_hex_chars(self):
+        sid = self._run("collision resistance")
+        self.assertEqual(len(sid), 16)
+
+    def test_resolve_ref_rejects_empty_and_traversal(self):
+        for bad in ("", ".", "..", "../x", "a/b"):
+            with self.assertRaises(StoreError):
+                self.store.resolve_ref(bad)
+
+    def test_load_conversation_tolerates_corrupt_lines(self):
+        sid = self.store.create_session(task="x")
+        log = self.store.sessions_dir / sid / "conversation.jsonl"
+        log.write_text(
+            '{"role": "user", "content": "good"}\n'
+            'not json\n'
+            '{"role": "assistant", "content": "also good"}\n',
+            encoding="utf-8",
+        )
+        msgs = self.store.load_conversation(sid)
+        self.assertEqual(
+            [m["content"] for m in msgs], ["good", "also good"]
+        )
+
+    def test_restore_skips_symlinks(self):
+        sid = self._run("make files")
+        work = self.store.work_dir
+        (work / "out.txt").write_text("hello")
+        outside = Path(self._tmp.name) / "outside.txt"
+        outside.write_text("secret")
+        (work / "link").symlink_to(outside)
+        files, _ = self.store.snapshot_artifacts(sid, str(work))
+        self.assertEqual(files, 1)
+        self.assertFalse(
+            (self.store.sessions_dir / sid / "artifacts" / "link").exists()
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

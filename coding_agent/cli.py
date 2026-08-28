@@ -28,9 +28,9 @@ from typing import Any
 
 from . import __version__
 from .agent import Agent, AgentError
-from .config import load_config
+from .config import load_config, parse_headers, validate_config
 from .llm import LLMClient
-from .security import detect_sandbox_backend
+from .security import detect_sandbox_backend, redact
 from .store import SessionStore, StoreError
 from .tools import TOOL_SCHEMAS, ToolRunner
 
@@ -44,7 +44,8 @@ coding-agent REPL — turns are merged into ONE session (sealed on exit).
   /status   workspace & branch status
   /log      recent sessions
   /branch   list branches
-  /exit     quit (or send an empty line)
+  /save     save (checkpoint) the current session to disk now
+  /exit     quit
 """
 
 
@@ -71,22 +72,33 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--workdir", help="Working directory for the agent (default: <workspace>/work).")
     p.add_argument("--system-prompt", help="Override the default system prompt.")
     p.add_argument("--command-timeout", type=float, help="Max seconds per command (default 120).")
-    p.add_argument("--sandbox", action="store_true",
+    p.add_argument("--sandbox", action=argparse.BooleanOptionalAction, default=None,
                    help="Run commands in a network-less, read-only-root sandbox (bwrap/firejail).")
     p.add_argument("--env-allow", help="Extra env vars (comma-separated) to pass through to commands.")
-    p.add_argument("--no-subagents", action="store_true", help="Disable read-only subagents (parallel_search).")
+    p.add_argument("--subagents", action=argparse.BooleanOptionalAction, default=None,
+                   help="Enable read-only subagents (parallel_search).")
     p.add_argument("--subagent-parallel", type=int, help="Max concurrent subagents (default 4).")
-    p.add_argument("--no-stream", action="store_true", help="Disable live streaming of assistant text and command output.")
-    p.add_argument("--no-skills", action="store_true", help="Disable auto-loading of agent skills.")
+    p.add_argument("--stream", action=argparse.BooleanOptionalAction, default=None,
+                   help="Stream assistant text and command output live.")
+    p.add_argument("--skills", action=argparse.BooleanOptionalAction, default=None,
+                   help="Auto-load keyword-matched agent skills.")
     p.add_argument("--max-skills", type=int, help="Max skills to inject per session (default 3).")
-    p.add_argument("--compact", action="store_true",
+    p.add_argument("--minimal", action=argparse.BooleanOptionalAction, default=None,
+                   help="Minimal mode: print only the final answer (silences progress, streaming, skills, subagents).")
+    p.add_argument("--compact", action=argparse.BooleanOptionalAction, default=None,
                    help="Summarize oldest turns when context overflows (cache-friendly).")
-    p.add_argument("--allow-outside-workdir", action="store_true",
+    p.add_argument("--allow-outside-workdir", action=argparse.BooleanOptionalAction, default=None,
                    help="Allow file tools to touch paths outside the working directory.")
-    p.add_argument("--allow-dangerous-commands", action="store_true",
+    p.add_argument("--allow-dangerous-commands", action=argparse.BooleanOptionalAction, default=None,
                    help="Allow commands that match the blocked dangerous-command patterns.")
-    p.add_argument("-v", "--verbose", action="store_true", help="Log each agent/tool step to stderr.")
-    p.add_argument("-q", "--quiet", action="store_true", help="Suppress progress output (stderr).")
+    p.add_argument("--snapshot", action=argparse.BooleanOptionalAction, default=None,
+                   help="Snapshot the workspace work/ directory into each session.")
+    p.add_argument("-v", "--verbose", action=argparse.BooleanOptionalAction, default=None,
+                   help="Log each agent/tool step to stderr.")
+    p.add_argument("-q", "--quiet", action=argparse.BooleanOptionalAction, default=None,
+                   help="Suppress progress output (stderr).")
+    p.add_argument("--header", action="append", metavar="NAME:VALUE",
+                   help="Extra HTTP header for the model API; may be repeated.")
     p.add_argument("-i", "--interactive", action="store_true", help="Alias for `repl`.")
     p.add_argument("--list-tools", action="store_true", help="Print available tools and exit.")
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
@@ -107,15 +119,24 @@ def _cli_overrides(opts: argparse.Namespace) -> dict[str, Any]:
         overrides["subagent_parallel"] = opts.subagent_parallel
     if getattr(opts, "max_skills", None) is not None:
         overrides["max_skills"] = opts.max_skills
-    if getattr(opts, "no_subagents", False):
-        overrides["subagents"] = False
-    if getattr(opts, "no_stream", False):
-        overrides["stream"] = False
-    if getattr(opts, "no_skills", False):
-        overrides["skills"] = False
-    for flag in ("allow_outside_workdir", "allow_dangerous_commands", "verbose", "compact", "quiet", "sandbox"):
-        if getattr(opts, flag, False):
-            overrides[flag] = True
+    for flag in (
+        "allow_outside_workdir", "allow_dangerous_commands", "verbose",
+        "compact", "quiet", "sandbox", "minimal", "subagents", "stream",
+        "skills", "snapshot",
+    ):
+        value = getattr(opts, flag, None)
+        if value is not None:
+            overrides[flag] = value
+    headers: dict[str, str] = {}
+    for raw in getattr(opts, "header", None) or []:
+        try:
+            headers.update(parse_headers(raw))
+        except ValueError as exc:
+            # argparse cannot validate this at parse time; surface it during
+            # dispatch through a synthetic override key handled by main().
+            overrides["_header_error"] = str(exc)
+    if headers:
+        overrides["extra_headers"] = headers
     return overrides
 
 
@@ -129,6 +150,7 @@ def _build_agent(config: Any, workdir: str, history: list[dict[str, Any]] | None
         temperature=config.temperature,
         retries=config.request_retries,
         verbose=config.verbose,
+        extra_headers=getattr(config, "extra_headers", None),
     )
     tools = ToolRunner(
         workdir=workdir,
@@ -148,6 +170,47 @@ def _resolve_workdir(config: Any, opts: argparse.Namespace, store: SessionStore)
     return str(Path(raw).expanduser().resolve())
 
 
+def _should_snapshot(config: Any, store: SessionStore, workdir: str) -> tuple[bool, str]:
+    if not getattr(config, "snapshot", True):
+        return False, "snapshot disabled"
+    if Path(workdir).resolve() == store.work_dir.resolve():
+        return True, ""
+    return False, "custom workdir; only the workspace work/ directory is snapshotted"
+
+
+def _seal_session(
+    config: Any,
+    store: SessionStore,
+    workdir: str,
+    messages: list[dict[str, Any]],
+    task: str,
+    parent: str | None,
+    message: str | None = None,
+    error: str = "",
+) -> str:
+    """Create, persist and advance a session (successful or failed)."""
+    sid = store.create_session(
+        task=redact(task),
+        parent=parent,
+        message=redact(message) if message else None,
+        workdir=workdir,
+        model=config.model,
+        status="failed" if error else "ok",
+        error=error,
+    )
+    store.save_conversation(sid, messages[1:])  # drop the system prompt
+    do_snapshot, reason = _should_snapshot(config, store, workdir)
+    if do_snapshot:
+        try:
+            store.snapshot_artifacts(sid, workdir)
+        except (StoreError, OSError) as exc:
+            print(f"warning: could not snapshot artifacts: {exc}", file=sys.stderr)
+    elif reason and not getattr(config, "quiet", False):
+        print(f"[run] not snapshotted: {reason}", file=sys.stderr)
+    store.advance_head(sid)
+    return sid
+
+
 def _run_task(config: Any, store: SessionStore, workdir: str, task: str, message: str | None = None) -> int:
     head = store.resolve_head()
     history = store.load_conversation(head) if head else None
@@ -155,28 +218,39 @@ def _run_task(config: Any, store: SessionStore, workdir: str, task: str, message
     if not getattr(config, "quiet", False):
         print(f"[run] branch {branch} · model {config.model} · {workdir}", file=sys.stderr)
     agent = _build_agent(config, workdir, history=history)
+    error = ""
     try:
         answer = agent.run(task)
     except AgentError as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        error = str(exc)
+        answer = ""
+
+    try:
+        with store.locked():
+            sid = _seal_session(
+                config, store, workdir, agent.messages, task, head,
+                message=message, error=error,
+            )
+    except (StoreError, OSError) as exc:
+        print(f"error: could not save session: {exc}", file=sys.stderr)
         return 1
 
-    sid = store.create_session(
-        task=task, parent=head, message=message, workdir=workdir, model=config.model
-    )
-    store.save_conversation(sid, agent.messages[1:])  # drop the system prompt
-    store.snapshot_artifacts(sid, workdir)
-    store.advance_head(sid)
-
-    if getattr(config, "stream", False):
+    if error:
+        print(f"error: {error}", file=sys.stderr)
+    elif getattr(config, "stream", False):
         # The answer was already streamed to stdout; just terminate the line.
         if answer and not answer.endswith("\n"):
             print()
     else:
         print(answer)
     if not getattr(config, "quiet", False):
-        print(f"[session {sid}] on branch {store.current_branch() or '(detached)'}", file=sys.stderr)
-    return 0
+        status = "failed" if error else ""
+        print(
+            f"[session {sid}]{(' ' + status) if status else ''} on "
+            f"branch {store.current_branch() or '(detached)'}",
+            file=sys.stderr,
+        )
+    return 1 if error else 0
 
 
 # -- commands ---------------------------------------------------------------
@@ -258,8 +332,12 @@ def _log(store: SessionStore, all_branches: bool, oneline: bool, graph: bool = F
 
 
 def _show(store: SessionStore, ref: str, tail: int) -> int:
-    sid = store.resolve_ref(ref)
-    msgs = store.load_conversation(sid)
+    try:
+        sid = store.resolve_ref(ref)
+        msgs = store.load_conversation(sid)
+    except (StoreError, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
     if not msgs:
         print("(empty session)")
         return 0
@@ -279,8 +357,9 @@ def _show(store: SessionStore, ref: str, tail: int) -> int:
 
 def _switch(store: SessionStore, ref: str, restore: bool) -> int:
     try:
-        sid = store.checkout(ref, restore=restore)
-    except StoreError as exc:
+        with store.locked():
+            sid = store.checkout(ref, restore=restore)
+    except (StoreError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     note = " (work/ restored)" if restore else ""
@@ -306,8 +385,9 @@ def _branch(store: SessionStore, args: list[str]) -> int:
             print("usage: branch -d <name>", file=sys.stderr)
             return 1
         try:
-            store.delete_branch(args[1])
-        except StoreError as exc:
+            with store.locked():
+                store.delete_branch(args[1])
+        except (StoreError, OSError) as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1
         print(f"deleted branch {args[1]}")
@@ -317,8 +397,9 @@ def _branch(store: SessionStore, args: list[str]) -> int:
         print("usage: branch [<name>] | branch -d <name>", file=sys.stderr)
         return 1
     try:
-        store.create_branch(name)
-    except StoreError as exc:
+        with store.locked():
+            store.create_branch(name)
+    except (StoreError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     print(f"branch {name} -> {store.resolve_head()}")
@@ -330,8 +411,9 @@ def _rm(store: SessionStore, args: list[str]) -> int:
         print("usage: rm <session-id-or-prefix>", file=sys.stderr)
         return 1
     try:
-        store.delete_session(args[0])
-    except StoreError as exc:
+        with store.locked():
+            store.delete_session(args[0])
+    except (StoreError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     print(f"deleted session {args[0]}")
@@ -354,6 +436,33 @@ def _repl(opts: argparse.Namespace, config: Any, store: SessionStore, workdir: s
     agent = _build_agent(config, workdir, history=history)
     initial_len = len(agent.messages)
     first_task = ""
+    last_error = ""
+
+    def checkpoint() -> bool:
+        """Save accumulated turns as one session and continue from it."""
+        nonlocal head, agent, initial_len, first_task, last_error
+        if len(agent.messages) <= initial_len:
+            print("(nothing to save)", file=sys.stderr)
+            return True
+        try:
+            with store.locked():
+                sid = _seal_session(
+                    config, store, workdir, agent.messages,
+                    task=first_task or "repl checkpoint",
+                    parent=head, message=opts.message, error=last_error,
+                )
+        except (StoreError, OSError) as exc:
+            print(f"error: could not save session: {exc}", file=sys.stderr)
+            return False
+        print(f"[session {sid}]", file=sys.stderr)
+        head = sid
+        history = store.load_conversation(sid)
+        agent = _build_agent(config, workdir, history=history)
+        initial_len = len(agent.messages)
+        first_task = ""
+        last_error = ""
+        return True
+
     while True:
         try:
             line = input(prompt)
@@ -374,6 +483,9 @@ def _repl(opts: argparse.Namespace, config: Any, store: SessionStore, workdir: s
         if s == "/branch":
             _branch(store, [])
             continue
+        if s == "/save":
+            checkpoint()
+            continue
         if s in ("/help", "help"):
             print(_REPL_BANNER, file=sys.stderr)
             continue
@@ -385,6 +497,7 @@ def _repl(opts: argparse.Namespace, config: Any, store: SessionStore, workdir: s
         try:
             answer = agent.run(s)
         except AgentError as exc:
+            last_error = str(exc)
             print(f"error: {exc}", file=sys.stderr)
             continue
         if getattr(config, "stream", False):
@@ -395,16 +508,16 @@ def _repl(opts: argparse.Namespace, config: Any, store: SessionStore, workdir: s
 
     # Seal the whole REPL interaction as ONE session (multi-turn, single commit).
     if len(agent.messages) > initial_len:
-        sid = store.create_session(
-            task=first_task,
-            parent=head,
-            message=opts.message,
-            workdir=workdir,
-            model=config.model,
-        )
-        store.save_conversation(sid, agent.messages[1:])
-        store.snapshot_artifacts(sid, workdir)
-        store.advance_head(sid)
+        try:
+            with store.locked():
+                sid = _seal_session(
+                    config, store, workdir, agent.messages,
+                    task=first_task or "repl",
+                    parent=head, message=opts.message, error=last_error,
+                )
+        except (StoreError, OSError) as exc:
+            print(f"error: could not save session: {exc}", file=sys.stderr)
+            return 1
         print(f"[session {sid}]", file=sys.stderr)
     return 0
 
@@ -417,12 +530,24 @@ def _print_tools() -> None:
 
 # -- dispatch ---------------------------------------------------------------
 def _dispatch(opts: argparse.Namespace, cmd: str, cmd_args: list[str]) -> int:
-    config = load_config(_cli_overrides(opts))
+    overrides = _cli_overrides(opts)
+    header_error = overrides.pop("_header_error", None)
+    if header_error:
+        print(f"error: {header_error}", file=sys.stderr)
+        return 2
+    config = load_config(overrides)
+    config_errors = validate_config(config)
+    if config_errors:
+        for exc in config_errors:
+            print(f"error: invalid configuration: {exc}", file=sys.stderr)
+        return 2
 
     if cmd == "run":
         if not _check_sandbox(config):
             return 2
-        task = " ".join(cmd_args)
+        task = " ".join(cmd_args).strip()
+        if not task and not sys.stdin.isatty():
+            task = sys.stdin.read().strip()
         return _run(opts, config, task)
 
     if cmd == "init":

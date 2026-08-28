@@ -19,6 +19,8 @@ from typing import Any
 
 # HTTP statuses worth retrying (rate limits and transient server faults).
 _TRANSIENT_STATUS = {408, 429, 500, 502, 503, 504}
+# Hard cap on a single completion response body (non-streaming and streaming).
+MAX_RESPONSE_BYTES = 10 * 1024 * 1024
 
 
 class LLMError(Exception):
@@ -75,6 +77,7 @@ class LLMClient:
         temperature: float | None = 0.2,
         retries: int = 3,
         verbose: bool = False,
+        extra_headers: dict[str, str] | None = None,
     ):
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
@@ -84,6 +87,7 @@ class LLMClient:
         self.temperature = temperature
         self.retries = retries
         self.verbose = verbose
+        self.extra_headers = dict(extra_headers or {})
 
     def _payload(self, messages: list[dict[str, Any]], tools: list[dict] | None) -> dict[str, Any]:
         payload: dict[str, Any] = {"model": self.model, "messages": messages}
@@ -102,6 +106,8 @@ class LLMClient:
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = "Bearer " + self.api_key
+        for name, value in self.extra_headers.items():
+            headers[name] = value
         return urllib.request.Request(url, data=data, method="POST", headers=headers)
 
     def _open(self, req: urllib.request.Request):
@@ -112,6 +118,16 @@ class LLMClient:
             raise LLMError(exc.code, f"HTTP {exc.code} from the model API", raw) from exc
         except urllib.error.URLError as exc:
             raise LLMError(None, f"connection error: {exc.reason}") from exc
+        except (TimeoutError, OSError) as exc:
+            raise LLMError(None, f"connection error: {exc}") from exc
+
+    @staticmethod
+    def _read_response(resp: Any) -> str:
+        """Read a non-streaming response body, enforcing a size cap."""
+        raw = resp.read(MAX_RESPONSE_BYTES + 1)
+        if len(raw) > MAX_RESPONSE_BYTES:
+            raise LLMError(None, f"model API response exceeded {MAX_RESPONSE_BYTES} bytes")
+        return raw.decode("utf-8", "replace")
 
     def _retry(self, exc: LLMError, attempt: int) -> bool:
         transient = exc.status in _TRANSIENT_STATUS or exc.status is None
@@ -133,11 +149,22 @@ class LLMClient:
         for attempt in range(self.retries + 1):
             try:
                 with self._open(self._build_request(payload)) as resp:
-                    data = json.loads(resp.read().decode("utf-8"))
+                    raw = self._read_response(resp)
+                try:
+                    data = json.loads(raw)
+                except json.JSONDecodeError as exc:
+                    raise LLMError(
+                        None, "invalid JSON from the model API", raw[:2000]
+                    ) from exc
                 return self._parse(data)
             except LLMError as exc:
                 last_error = exc
                 if self._retry(exc, attempt):
+                    continue
+                raise
+            except (OSError, ValueError) as exc:
+                last_error = LLMError(None, f"failed to read model response: {exc}")
+                if self._retry(last_error, attempt):
                     continue
                 raise
         raise last_error  # type: ignore[misc]
@@ -165,25 +192,49 @@ class LLMClient:
                 if self._retry(exc, attempt):
                     continue
                 raise
+            except (OSError, ValueError) as exc:
+                last_error = LLMError(None, f"failed to read model stream: {exc}")
+                if self._retry(last_error, attempt):
+                    continue
+                raise
         raise last_error  # type: ignore[misc]
 
     def _read_stream(self, req: urllib.request.Request, on_text: Any) -> AssistantMessage:
         content_parts: list[str] = []
         tool_calls: dict[int, dict[str, str]] = {}
         finish_reason = ""
-        first = True
+        total_bytes = 0
         with self._open(req) as resp:
             for raw in resp:
+                total_bytes += len(raw)
+                if total_bytes > MAX_RESPONSE_BYTES:
+                    raise LLMError(
+                        None, f"model API stream exceeded {MAX_RESPONSE_BYTES} bytes"
+                    )
                 line = raw.decode("utf-8", "replace")
-                if first:
-                    first = False
+                if not line.lstrip().startswith("data:"):
                     # A gateway may ignore `stream` and return plain JSON.
-                    if not line.lstrip().startswith("data:"):
-                        body = line + resp.read().decode("utf-8", "replace")
-                        msg = self._parse(json.loads(body))
-                        if on_text and msg.content:
-                            on_text(msg.content)
-                        return msg
+                    try:
+                        rest = resp.read(MAX_RESPONSE_BYTES - total_bytes + 1)
+                    except TypeError:  # test/mock response objects without size arg
+                        rest = resp.read()
+                    total_bytes += len(rest)
+                    if total_bytes > MAX_RESPONSE_BYTES:
+                        raise LLMError(
+                            None, f"model API response exceeded {MAX_RESPONSE_BYTES} bytes"
+                        )
+                    body = (line + rest.decode("utf-8", "replace")).strip()
+                    try:
+                        data = json.loads(body)
+                    except json.JSONDecodeError as exc:
+                        raise LLMError(
+                            None, "invalid JSON from the model API", body[:2000]
+                        ) from exc
+                    msg = self._parse(data)
+                    if on_text and msg.content:
+                        on_text(msg.content)
+                    return msg
+
                 s = line.strip()
                 if not s or s.startswith(":"):
                     continue
@@ -232,7 +283,16 @@ class LLMClient:
             raise LLMError(None, "unexpected API response shape", json.dumps(data)) from exc
 
         message = choice.get("message") or {}
-        content = message.get("content") or ""
+        raw_content = message.get("content") or ""
+        if isinstance(raw_content, list):
+            content = "".join(
+                part.get("text", "") if isinstance(part, dict) else str(part)
+                for part in raw_content
+            )
+        elif isinstance(raw_content, str):
+            content = raw_content
+        else:
+            content = str(raw_content)
         tool_calls: list[ToolCall] = []
         for raw in message.get("tool_calls") or []:
             fn = raw.get("function") or {}

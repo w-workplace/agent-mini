@@ -27,6 +27,7 @@ import sys
 from typing import Any
 
 from .llm import LLMClient, LLMError
+from .security import redact
 from .skills import discover_skills, load_skills, skill_prompt
 from .tools import ToolRunner, format_tool_result
 
@@ -137,13 +138,17 @@ class Agent:
     # -- public API ----------------------------------------------------------
     def run(self, task: str) -> str:
         """Run the agent on one task; returns the model's final answer."""
+        safe_task = redact(task)
+        if safe_task != task:
+            self._progress("[security] redacted potential secrets from the task")
+            task = safe_task
         if self._skills_pending:
             self._skills_pending = False
             for skill in discover_skills(task, self.skills, self.config.max_skills):
                 self.messages.append({"role": "user", "content": skill_prompt(skill)})
                 self._progress(f"[skill] loaded {skill.name}")
         self.messages.append({"role": "user", "content": task})
-        signatures: list[tuple[tuple[str, str], ...]] = []
+        signatures: list[tuple[tuple[str, str, str], ...]] = []
         final_answer = ""
 
         for step in range(1, self.config.max_iterations + 1):
@@ -157,14 +162,26 @@ class Agent:
             self._show_step(step, reply)
 
             if not reply.tool_calls:
+                if getattr(reply, "finish_reason", "") == "tool_calls":
+                    raise AgentError(
+                        "the model returned finish_reason='tool_calls' without "
+                        "any tool calls; refusing to treat that as a final answer"
+                    )
                 final_answer = reply.content or "(the model returned no text)"
                 break
 
-            signature: list[tuple[str, str]] = []
+            signature: list[tuple[str, str, str]] = []
             for tc in reply.tool_calls:
-                signature.append((tc.name, json.dumps(tc.arguments, sort_keys=True)))
-                self._show_tool_start(step, tc)
                 result = self.tools.execute(tc.name, tc.arguments)
+                fingerprint = self._tool_result_fingerprint(result)
+                signature.append(
+                    (
+                        tc.name,
+                        json.dumps(tc.arguments, sort_keys=True, ensure_ascii=False),
+                        fingerprint,
+                    )
+                )
+                self._show_tool_start(step, tc)
                 self.messages.append(
                     {
                         "role": "tool",
@@ -177,7 +194,7 @@ class Agent:
             signatures.append(tuple(signature))
             if self._is_stuck(signatures):
                 raise AgentError(
-                    "the model repeated the same tool call without making "
+                    "the model repeated the same tool call with no observable "
                     "progress; aborting to avoid an infinite loop"
                 )
         else:
@@ -246,16 +263,26 @@ class Agent:
                 total += max(1, len(json.dumps(tc, ensure_ascii=False)) // 4)
         return total
 
+    def _estimate_tool_tokens(self) -> int:
+        """Estimate tokens consumed by the tool schemas sent with every call."""
+        schemas = json.dumps(self.tool_schemas, ensure_ascii=False)
+        # Add a modest per-request framing allowance so the estimate does not
+        # undercount the actual wire payload.
+        return max(0, len(schemas) // 4) + 32
+
     def _manage_context(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         limit = self.config.context_limit_tokens
-        if limit <= 0 or self._estimate_tokens(messages) <= limit:
+        if limit <= 0:
+            return messages
+        effective_limit = max(1, limit - self._estimate_tool_tokens())
+        if self._estimate_tokens(messages) <= effective_limit:
             return messages
         if getattr(self.config, "compact", False):
             try:
-                return self._compact(messages)
+                return self._compact(messages, limit=effective_limit)
             except Exception:  # noqa: BLE001 — fall back to dropping oldest
-                return self._trim_context(messages)
-        return self._trim_context(messages)
+                return self._trim_context(messages, limit=effective_limit)
+        return self._trim_context(messages, limit=effective_limit)
 
     @staticmethod
     def _split_turns(rest: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
@@ -318,15 +345,19 @@ class Agent:
         )
         return SUMMARY_MARKER + "\n" + (reply.content or "")
 
-    def _compact(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _compact(
+        self,
+        messages: list[dict[str, Any]],
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
         """Fold the oldest turns into one stable summary block.
 
-        The summary sits immediately after the system prompt, so the prefix
-        ``[system][summary]`` stays stable across subsequent turns (and across
-        sessions that continue this one) until the recent window itself
-        overflows and the summary is regenerated.
+        The latest turn is always preserved verbatim; older turns are folded
+        into the summary.  The summary sits immediately after the system
+        prompt, so the prefix ``[system][summary]`` stays stable across turns.
         """
-        limit = self.config.context_limit_tokens
+        if limit is None:
+            limit = self.config.context_limit_tokens
         system = messages[0] if messages and messages[0]["role"] == "system" else None
         rest = messages[1:] if system else messages
         turns = self._split_turns(rest)
@@ -336,20 +367,23 @@ class Agent:
             summary_text = turns[0][0]["content"]
             turns = turns[1:]
 
+        if not turns:
+            out = [system] if system else []
+            return out
+
         system_tokens = self._estimate_tokens([system]) if system else 0
         reserve = max(1, (limit - system_tokens) // 2)
 
-        keep: list[list[dict[str, Any]]] = []
+        latest = turns[-1]
+        keep: list[list[dict[str, Any]]] = [latest]
+        used = self._estimate_tokens(latest)
         fold: list[list[dict[str, Any]]] = []
-        used = 0
-        overflow = False
-        for turn in reversed(turns):
+        for turn in reversed(turns[:-1]):
             t = self._estimate_tokens(turn)
-            if not overflow and used + t <= reserve:
+            if used + t <= reserve:
                 keep.insert(0, turn)
                 used += t
             else:
-                overflow = True
                 fold.insert(0, turn)
 
         if fold:
@@ -364,7 +398,7 @@ class Agent:
             out.extend(turn)
 
         if self._estimate_tokens(out) > limit:
-            return self._trim_context(messages)
+            return self._trim_context(messages, limit=limit)
         if len(out) < len(messages):
             self._progress(
                 f"[context] compacted {len(messages) - len(out)} messages into "
@@ -372,23 +406,34 @@ class Agent:
             )
         return out
 
-    def _trim_context(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Fallback: drop the oldest turns (not cache-optimal, but always works)."""
-        limit = self.config.context_limit_tokens
+    def _trim_context(
+        self,
+        messages: list[dict[str, Any]],
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Fallback: drop the oldest turns (not cache-optimal, but always works).
+
+        The newest turn is always retained, even if it alone exceeds the
+        budget; dropping it would send a request without the user's task.
+        """
+        if limit is None:
+            limit = self.config.context_limit_tokens
         system = messages[0] if messages and messages[0]["role"] == "system" else None
         rest = messages[1:] if system else messages
         turns = self._split_turns(rest)
+        if not turns:
+            return messages
 
         budget = limit - (self._estimate_tokens([system]) if system else 0)
-        keep: list[list[dict[str, Any]]] = []
-        used = 0
-        for turn in reversed(turns):
+        latest = turns[-1]
+        keep: list[list[dict[str, Any]]] = [latest]
+        used = self._estimate_tokens(latest)
+        for turn in reversed(turns[:-1]):
             t = self._estimate_tokens(turn)
             if used + t > budget:
                 break
-            keep.append(turn)
+            keep.insert(0, turn)
             used += t
-        keep.reverse()
 
         out: list[dict[str, Any]] = []
         if system:
@@ -400,13 +445,41 @@ class Agent:
                 f"[context] trimmed {len(messages) - len(out)} messages to fit "
                 f"the {limit}-token budget"
             )
+        if self._estimate_tokens(out) > limit:
+            self._progress(
+                "[context] warning: newest turn alone exceeds the token budget"
+            )
         return out
 
     # -- loop guard -----------------------------------------------------------
     @staticmethod
-    def _is_stuck(signatures: list[tuple[tuple[str, str], ...]], window: int = 3) -> bool:
-        """True when the last `window` tool-call signatures are identical."""
+    def _is_stuck(
+        signatures: list[tuple[tuple[str, str, str], ...]],
+        window: int = 3,
+    ) -> bool:
+        """True when the last `window` tool calls are identical *and* produced
+        identical results.
+
+        ``signatures`` entries are ``(tool_name, arguments_json, result_fingerprint)``.
+        Older callers may pass 2-tuples; in that case only name+arguments are
+        compared (backward-compatible with the previous behaviour).
+        """
         if len(signatures) < window:
             return False
         recent = signatures[-window:]
-        return all(s == recent[0] for s in recent)
+        first = recent[0]
+        for sig in recent[1:]:
+            if sig[:2] != first[:2]:
+                return False
+            if len(sig) > 2 and len(first) > 2 and sig[2] != first[2]:
+                return False
+        return True
+
+    @staticmethod
+    def _tool_result_fingerprint(result: dict[str, Any]) -> str:
+        """Stable-ish fingerprint of a tool result for the loop guard."""
+        try:
+            compact = json.dumps(result, sort_keys=True, ensure_ascii=False)
+        except (TypeError, ValueError):
+            compact = repr(result)
+        return compact[:512]

@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 import os
 import sys
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any, Callable
 
@@ -45,6 +45,9 @@ DEFAULTS: dict[str, Any] = {
     "stream": True,  # stream assistant text and command output live
     "skills": True,  # auto-load keyword-matched agent skills
     "max_skills": 3,  # max skills to inject per session
+    "snapshot": True,   # snapshot the workspace work/ directory into each session
+    "extra_headers": {},  # additional HTTP headers for the model API
+    "minimal": False,  # minimal mode: print only the final answer
     "verbose": False,
     "quiet": False,  # suppress progress output
     "system_prompt": "",
@@ -84,6 +87,8 @@ _BOOLEAN_CASTERS: dict[str, Callable[[str], bool]] = {
     "subagents": _parse_bool,
     "stream": _parse_bool,
     "skills": _parse_bool,
+    "minimal": _parse_bool,
+    "snapshot": _parse_bool,
     "verbose": _parse_bool,
     "quiet": _parse_bool,
 }
@@ -113,6 +118,9 @@ class Config:
     stream: bool = True
     skills: bool = True
     max_skills: int = 3
+    snapshot: bool = True
+    extra_headers: dict[str, str] = field(default_factory=dict)
+    minimal: bool = False
     verbose: bool = False
     quiet: bool = False
     system_prompt: str = ""
@@ -149,6 +157,32 @@ def _read_json_file(path: Path) -> dict[str, Any]:
     return data
 
 
+def _parse_headers(raw: str) -> dict[str, str]:
+    """Parse ``Header: value`` pairs (comma-separated) into a header dict."""
+    headers: dict[str, str] = {}
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if ":" in item:
+            name, value = item.split(":", 1)
+        elif "=" in item:
+            name, value = item.split("=", 1)
+        else:
+            raise ValueError(f"invalid header {item!r}; expected 'Name: value'")
+        name = name.strip()
+        value = value.strip()
+        if not name:
+            raise ValueError(f"invalid header {item!r}; empty name")
+        headers[name] = value
+    return headers
+
+
+def parse_headers(raw: str) -> dict[str, str]:
+    """Public helper: parse ``Name: value`` header pairs from a string."""
+    return _parse_headers(raw)
+
+
 def _apply_env(cfg: dict[str, Any]) -> None:
     for key, names in _ENV_KEYS.items():
         for name in names:
@@ -169,12 +203,19 @@ def _apply_env(cfg: dict[str, Any]) -> None:
         name = "LLM_" + key.upper()
         if os.environ.get(name):
             cfg[key] = caster(os.environ[name])
+    raw_headers = os.environ.get("LLM_EXTRA_HEADERS")
+    if raw_headers:
+        try:
+            cfg["extra_headers"] = _parse_headers(raw_headers)
+        except ValueError as exc:
+            print(f"warning: ignoring invalid LLM_EXTRA_HEADERS: {exc}", file=sys.stderr)
 
 
 def load_config(cli_overrides: dict[str, Any] | None = None) -> Config:
     """Load configuration from defaults, files, environment, then CLI args."""
     cli: dict[str, Any] = dict(cli_overrides or {})
     cfg: dict[str, Any] = dict(DEFAULTS)
+    cfg["extra_headers"] = dict(DEFAULTS["extra_headers"])
 
     # 1. project config
     proj_data: dict[str, Any] = {}
@@ -212,5 +253,49 @@ def load_config(cli_overrides: dict[str, Any] | None = None) -> Config:
     # 5. CLI overrides (last)
     cfg.update({k: v for k, v in cli.items() if v is not None})
 
+    # Minimal mode takes precedence: silence output and disable non-essential
+    # features (streaming, skills, subagents) for clean, scriptable output.
+    if cfg.get("minimal"):
+        cfg["quiet"] = True
+        cfg["stream"] = False
+        cfg["subagents"] = False
+        cfg["skills"] = False
+        cfg["verbose"] = False
+
     valid = {f.name for f in fields(Config)}
     return Config(**{k: v for k, v in cfg.items() if k in valid})
+
+
+def validate_config(config: "Config") -> list[str]:
+    """Return a list of human-readable configuration errors (empty if valid)."""
+    errors: list[str] = []
+    positive = {
+        "max_iterations": config.max_iterations,
+        "context_limit_tokens": config.context_limit_tokens,
+        "command_timeout": config.command_timeout,
+        "subagent_parallel": config.subagent_parallel,
+        "max_skills": config.max_skills,
+        "timeout": config.timeout,
+        "temperature": config.temperature,
+        "request_retries": config.request_retries,
+        "max_tokens": config.max_tokens,
+    }
+    for name, value in positive.items():
+        if isinstance(value, bool) or value < 0:
+            errors.append(f"{name} must be >= 0")
+    if config.max_iterations == 0:
+        errors.append("max_iterations must be >= 1")
+    if config.subagent_parallel == 0:
+        errors.append("subagent_parallel must be >= 1")
+    if config.timeout == 0:
+        errors.append("timeout must be > 0")
+    if config.command_timeout == 0:
+        errors.append("command_timeout must be > 0")
+    if config.verbose and config.quiet:
+        errors.append("--verbose and --quiet cannot be used together")
+    if not isinstance(config.extra_headers, dict) or not all(
+        isinstance(k, str) and isinstance(v, str)
+        for k, v in config.extra_headers.items()
+    ):
+        errors.append("extra_headers must be an object mapping strings to strings")
+    return errors

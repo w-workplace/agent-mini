@@ -9,5 +9,6 @@
   "command_timeout": 120.0,
   "allow_outside_workdir": false,
   "allow_dangerous_commands": false,
+  "snapshot": true,
   "verbose": false
 }
