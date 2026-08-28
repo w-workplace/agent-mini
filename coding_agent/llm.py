@@ -50,6 +50,7 @@ class AssistantMessage:
     content: str = ""
     tool_calls: list[ToolCall] = field(default_factory=list)
     finish_reason: str = ""
+    usage: dict[str, Any] = field(default_factory=dict)
     raw: dict[str, Any] = field(default_factory=dict)
 
     def to_api_dict(self) -> dict[str, Any]:
@@ -347,6 +348,8 @@ class LLMClient:
         """
         payload = self._payload(messages, tools)
         payload["stream"] = True
+        # Ask providers to include the usage chunk when they support it.
+        payload["stream_options"] = {"include_usage": True}
         last_error: LLMError | None = None
         for attempt in range(self.retries + 1):
             try:
@@ -367,6 +370,7 @@ class LLMClient:
         content_parts: list[str] = []
         tool_calls: dict[int, dict[str, str]] = {}
         finish_reason = ""
+        usage: dict[str, Any] = {}
         total_bytes = 0
         first = True
         with self._open(req) as resp:
@@ -442,6 +446,8 @@ class LLMClient:
                             entry["arguments"] += fn["arguments"]
                     if choice.get("finish_reason"):
                         finish_reason = choice["finish_reason"]
+                    if chunk.get("usage"):
+                        usage = chunk["usage"]
 
         content = "".join(content_parts)
         parsed_calls: list[ToolCall] = []
@@ -452,7 +458,12 @@ class LLMClient:
             except json.JSONDecodeError:
                 args = {"_raw": entry["arguments"], "_error": "invalid JSON arguments"}
             parsed_calls.append(ToolCall(entry["id"], entry["name"], args))
-        return AssistantMessage(content=content, tool_calls=parsed_calls, finish_reason=finish_reason)
+        return AssistantMessage(
+            content=content,
+            tool_calls=parsed_calls,
+            finish_reason=finish_reason,
+            usage=usage,
+        )
 
     def _parse(self, data: dict[str, Any]) -> AssistantMessage:
         try:
@@ -488,5 +499,6 @@ class LLMClient:
             content=content,
             tool_calls=tool_calls,
             finish_reason=choice.get("finish_reason", ""),
+            usage=data.get("usage") or {},
             raw=data,
         )

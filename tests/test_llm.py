@@ -56,6 +56,19 @@ class LLMParseTestCase(unittest.TestCase):
         self.assertEqual(msg.tool_calls[0].name, "read_file")
         self.assertEqual(msg.tool_calls[0].arguments, {"path": "a.txt"})
 
+    def test_parse_usage(self):
+        data = {
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "done"},
+                "finish_reason": "stop",
+            }],
+            "usage": {"prompt_tokens": 11, "completion_tokens": 2},
+        }
+        msg = self.client._parse(data)
+        self.assertEqual(msg.usage["prompt_tokens"], 11)
+        self.assertEqual(msg.usage["completion_tokens"], 2)
+
     def test_parse_malformed_arguments(self):
         data = {
             "choices": [

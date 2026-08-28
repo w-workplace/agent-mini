@@ -104,6 +104,14 @@ class ConfigTestCase(unittest.TestCase):
             {"X-Trace": "abc", "Authorization": "Bearer t"},
         )
 
+    def test_plan_ask_defaults_and_conflict(self):
+        self.assertFalse(self._load().plan)
+        self.assertFalse(self._load().ask)
+        self.assertTrue(any(
+            "--plan and --ask" in e
+            for e in validate_config(Config(plan=True, ask=True))
+        ))
+
     def test_validate_config_catches_conflicts_and_bad_values(self):
         self.assertEqual(validate_config(Config(verbose=True, quiet=True)), [
             "--verbose and --quiet cannot be used together"

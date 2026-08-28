@@ -9,6 +9,7 @@ can self-correct.
 
 from __future__ import annotations
 
+import difflib
 import fnmatch
 import glob
 import json
@@ -21,7 +22,7 @@ import threading
 from array import array
 from collections import OrderedDict, deque
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .security import build_sandbox_argv, command_env, detect_sandbox_backend, redact_obj
 
@@ -39,6 +40,7 @@ MAX_READ_INDEX_FILES = 4                 # LRU size for line-offset indexes
 MAX_OUTPUT_BYTES = 50 * 1024       # stdout/stderr kept from a command
 MAX_LIVE_OUTPUT_BYTES = 256 * 1024 # live command output echoed to stderr
 MAX_GREP_LINE_LEN = 500
+MAX_DIFF_CHARS = 4000
 
 
 class ToolError(Exception):
@@ -63,6 +65,38 @@ _SKIP_DIRS = {
     ".git", "node_modules", "__pycache__", ".venv", "venv", "dist",
     "build", ".tox", ".mypy_cache", ".pytest_cache", ".eggs", ".idea",
 }
+
+
+def _build_diff(
+    old_text: str,
+    new_text: str,
+    path: str,
+) -> tuple[str, int, int]:
+    """Return a compact unified diff and added/removed line counts."""
+    old_lines = old_text.splitlines()
+    new_lines = new_text.splitlines()
+    try:
+        diff_lines = list(
+            difflib.unified_diff(
+                old_lines,
+                new_lines,
+                fromfile=f"a/{path}",
+                tofile=f"b/{path}",
+                lineterm="",
+            )
+        )
+    except (ValueError, UnicodeError):
+        diff_lines = []
+    added = sum(
+        1 for line in diff_lines if line.startswith("+") and not line.startswith("+++")
+    )
+    removed = sum(
+        1 for line in diff_lines if line.startswith("-") and not line.startswith("---")
+    )
+    diff = "\n".join(diff_lines)
+    if len(diff) > MAX_DIFF_CHARS:
+        diff = diff[:MAX_DIFF_CHARS] + "\n[diff truncated]"
+    return diff, added, removed
 
 
 class _BoundedTail:
@@ -275,6 +309,7 @@ class ToolRunner:
         stream: bool = True,
         quiet: bool = False,
         subagent_executor: Any = None,
+        approval_callback: Callable[[str, str], bool] | None = None,
     ):
         self.workdir = Path(workdir).resolve()
         self.allow_outside_workdir = allow_outside_workdir
@@ -286,6 +321,7 @@ class ToolRunner:
         self.stream = stream
         self.quiet = quiet
         self.subagent_executor = subagent_executor
+        self.approval_callback = approval_callback
         self.sandbox_backend = detect_sandbox_backend() if sandbox else None
         self._schemas = {s["function"]["name"]: s["function"] for s in TOOL_SCHEMAS}
         self._executors: dict[str, Any] = {}
@@ -320,6 +356,15 @@ class ToolRunner:
     @staticmethod
     def _err(message: str) -> dict[str, Any]:
         return {"ok": False, "error": message}
+
+    def _approved(self, action: str, detail: str) -> bool:
+        """Return True when the action may proceed under --ask mode."""
+        if self.approval_callback is None:
+            return True
+        try:
+            return bool(self.approval_callback(action, detail))
+        except Exception:
+            return False
 
     def resolve_path(self, path: str) -> Path:
         p = Path(path)
@@ -564,12 +609,28 @@ class ToolRunner:
             return self._err(str(exc))
         if p.is_dir():
             return self._err(f"is a directory, not a file: {path}")
+        display = self._display_path(p)
+        if not self._approved("write_file", display):
+            return self._err(f"write_file {display!r} was not approved")
+        old_text = ""
+        try:
+            if p.is_file() and p.stat().st_size <= MAX_READ_BYTES:
+                old_text = p.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            old_text = ""
         data = content.encode("utf-8")
         try:
             self._atomic_write_text(p, content)
         except OSError as exc:
             return self._err(f"cannot write {path}: {exc}")
-        return self._ok(path=self._display_path(p), bytes_written=len(data))
+        result = {
+            "path": self._display_path(p),
+            "bytes_written": len(data),
+        }
+        if old_text != content:
+            diff, added, removed = _build_diff(old_text, content, result["path"])
+            result.update({"diff": diff, "added_lines": added, "removed_lines": removed})
+        return self._ok(**result)
 
     def edit_file(
         self,
@@ -584,6 +645,8 @@ class ToolRunner:
             return self._err(str(exc))
         if old_string == "":
             return self._err("old_string must be non-empty")
+        if not self._approved("edit_file", self._display_path(p)):
+            return self._err(f"edit_file {self._display_path(p)!r} was not approved")
         try:
             text = p.read_text(encoding="utf-8")
         except OSError as exc:
@@ -602,7 +665,13 @@ class ToolRunner:
             self._atomic_write_text(p, new_text)
         except OSError as exc:
             return self._err(f"cannot write {path}: {exc}")
-        return self._ok(path=self._display_path(p), replacements=replacements)
+        result = {
+            "path": self._display_path(p),
+            "replacements": replacements,
+        }
+        diff, added, removed = _build_diff(text, new_text, result["path"])
+        result.update({"diff": diff, "added_lines": added, "removed_lines": removed})
+        return self._ok(**result)
 
     def grep(self, pattern: str, path: str = ".", include: str | None = None) -> dict[str, Any]:
         try:
@@ -679,6 +748,9 @@ class ToolRunner:
                 return self._err(f"invalid timeout: {timeout!r}")
         if limit <= 0:
             return self._err("command timeout must be greater than zero")
+
+        if not self._approved("run_command", command[:160]):
+            return self._err("run_command was not approved")
 
         # Scrub the environment: never pass API keys/tokens to child commands.
         env = command_env(str(self.workdir), sandbox=self.sandbox, extra_allow=self.env_allow)

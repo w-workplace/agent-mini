@@ -47,6 +47,9 @@ DEFAULTS: dict[str, Any] = {
     "max_skills": 3,  # max skills to inject per session
     "snapshot": True,   # snapshot the workspace work/ directory into each session
     "extra_headers": {},  # additional HTTP headers for the model API
+    "plan": False,        # read-only planning mode (no writes or commands)
+    "ask": False,         # ask before write_file/edit_file/run_command
+    "rules": "",          # comma-separated rule files (plus AGENTS.md auto-load)
     "minimal": False,  # minimal mode: print only the final answer
     "verbose": False,
     "quiet": False,  # suppress progress output
@@ -59,6 +62,7 @@ _ENV_KEYS: dict[str, tuple[str, ...]] = {
     "api_key": ("LLM_API_KEY", "OPENAI_API_KEY"),
     "model": ("LLM_MODEL", "OPENAI_MODEL"),
     "env_allow": ("LLM_ENV_ALLOW",),
+    "rules": ("LLM_RULES",),
 }
 
 # Numeric environment variables (``LLM_<UPPER_NAME>``).
@@ -89,6 +93,8 @@ _BOOLEAN_CASTERS: dict[str, Callable[[str], bool]] = {
     "skills": _parse_bool,
     "minimal": _parse_bool,
     "snapshot": _parse_bool,
+    "plan": _parse_bool,
+    "ask": _parse_bool,
     "verbose": _parse_bool,
     "quiet": _parse_bool,
 }
@@ -120,6 +126,9 @@ class Config:
     max_skills: int = 3
     snapshot: bool = True
     extra_headers: dict[str, str] = field(default_factory=dict)
+    plan: bool = False
+    ask: bool = False
+    rules: str = ""
     minimal: bool = False
     verbose: bool = False
     quiet: bool = False
@@ -293,6 +302,8 @@ def validate_config(config: "Config") -> list[str]:
         errors.append("command_timeout must be > 0")
     if config.verbose and config.quiet:
         errors.append("--verbose and --quiet cannot be used together")
+    if config.plan and config.ask:
+        errors.append("--plan and --ask cannot be used together")
     if not isinstance(config.extra_headers, dict) or not all(
         isinstance(k, str) and isinstance(v, str)
         for k, v in config.extra_headers.items()

@@ -15,6 +15,7 @@ code-execution service.
 from .agent import Agent, AgentError, MaxIterationsExceeded
 from .config import Config, load_config
 from .llm import LLMClient, LLMError
+from .rules import load_rules
 from .skills import Skill, discover_skills, load_skills
 from .store import SessionStore, StoreError
 from .subagent import run_subagents
@@ -36,6 +37,7 @@ __all__ = [
     "ToolRunner",
     "discover_skills",
     "load_config",
+    "load_rules",
     "load_skills",
     "run_subagents",
     "__version__",

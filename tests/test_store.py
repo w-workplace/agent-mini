@@ -196,5 +196,22 @@ class SessionStoreTestCase(unittest.TestCase):
         )
 
 
+    def test_diff_session_and_workdir(self):
+        a = self._run("base")
+        (self.store.work_dir / "a.txt").write_text("one")
+        self.store.snapshot_artifacts(a, str(self.store.work_dir))
+        b = self.store.create_session(task="change", parent=a)
+        (self.store.work_dir / "a.txt").write_text("two")
+        (self.store.work_dir / "b.txt").write_text("new")
+        self.store.snapshot_artifacts(b, str(self.store.work_dir))
+        changes = self.store.diff_session(b)
+        self.assertEqual({c["path"]: c["status"] for c in changes},
+                         {"a.txt": "M", "b.txt": "A"})
+        self.store.advance_head(b)
+        (self.store.work_dir / "a.txt").write_text("three")
+        wd_changes = {c["path"]: c["status"] for c in self.store.diff_workdir()}
+        self.assertEqual(wd_changes, {"a.txt": "M"})
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -22,6 +22,7 @@ Layout (the "专属文件夹"):
 
 from __future__ import annotations
 
+import filecmp
 import json
 import os
 import secrets
@@ -282,6 +283,10 @@ class SessionStore:
         model: str = "",
         status: str = "ok",
         error: str = "",
+        duration_ms: float = 0.0,
+        usage: dict[str, Any] | None = None,
+        changed_files: list[str] | None = None,
+        mode: str = "",
     ) -> str:
         if parent is None:
             # Like git: a new commit's parent is the current HEAD.
@@ -307,6 +312,10 @@ class SessionStore:
             "created_at": time.time(),
             "status": status,
             "error": error,
+            "duration_ms": duration_ms,
+            "usage": usage or {},
+            "changed_files": changed_files or [],
+            "mode": mode,
         }
         self._write_json_atomic(d / "meta.json", meta)
         return sid
@@ -466,6 +475,68 @@ class SessionStore:
                     f"cannot delete: session {m['id']} descends from it; delete it first"
                 )
         shutil.rmtree(self.sessions_dir / sid, ignore_errors=True)
+
+    # -- diffs --------------------------------------------------------------
+    @staticmethod
+    def _snapshot_file_map(root: Path) -> dict[str, tuple[Path, int, int]]:
+        """Map relative path -> (abs path, size, mtime_ns) under a tree."""
+        out: dict[str, tuple[Path, int, int]] = {}
+        if not root.is_dir():
+            return out
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if d not in _SKIP_SNAPSHOT]
+            for fn in filenames:
+                rel = os.path.relpath(os.path.join(dirpath, fn), root)
+                abs_path = Path(dirpath) / fn
+                try:
+                    st = abs_path.stat()
+                except OSError:
+                    continue
+                out[rel.replace(os.sep, "/")] = (abs_path, st.st_size, st.st_mtime_ns)
+        return out
+
+    def _diff_artifact_dirs(
+        self,
+        left: Path | None,
+        right: Path | None,
+    ) -> list[dict[str, str]]:
+        old = self._snapshot_file_map(left) if left is not None else {}
+        new = self._snapshot_file_map(right) if right is not None else {}
+        changes: list[dict[str, str]] = []
+        for rel in sorted(new.keys() - old.keys()):
+            changes.append({"path": rel, "status": "A"})
+        for rel in sorted(old.keys() - new.keys()):
+            changes.append({"path": rel, "status": "D"})
+        for rel in sorted(old.keys() & new.keys()):
+            op, osize, _ = old[rel]
+            np, nsize, _ = new[rel]
+            if osize != nsize:
+                changes.append({"path": rel, "status": "M"})
+                continue
+            try:
+                same = filecmp.cmp(op, np, shallow=False)
+            except OSError:
+                same = False
+            if not same:
+                changes.append({"path": rel, "status": "M"})
+        return changes
+
+    def diff_session(self, session_id: str) -> list[dict[str, str]]:
+        """Compare a session's artifact snapshot with its parent snapshot."""
+        meta = self.load_meta(session_id)
+        child = self.sessions_dir / session_id / "artifacts"
+        child = child if child.is_dir() else None
+        parent = meta.get("parent")
+        parent_dir = self.sessions_dir / parent / "artifacts" if parent else None
+        parent_dir = parent_dir if (parent_dir and parent_dir.is_dir()) else None
+        return self._diff_artifact_dirs(parent_dir, child)
+
+    def diff_workdir(self, ref: str | None = None) -> list[dict[str, str]]:
+        """Compare the live workspace work/ tree with a session snapshot."""
+        sid = self.resolve_ref(ref) if ref else self.resolve_head()
+        snap = self.sessions_dir / sid / "artifacts" if sid else None
+        snap = snap if (snap and snap.is_dir()) else None
+        return self._diff_artifact_dirs(snap, self.work_dir)
 
     # -- artifacts -----------------------------------------------------------
     @contextmanager

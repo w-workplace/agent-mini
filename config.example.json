@@ -10,5 +10,8 @@
   "allow_outside_workdir": false,
   "allow_dangerous_commands": false,
   "snapshot": true,
+  "plan": false,
+  "ask": false,
+  "rules": "",
   "verbose": false
 }

@@ -24,10 +24,12 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from .llm import LLMClient, LLMError
+from .rules import load_rules
 from .security import redact
 from .skills import discover_skills, load_skills, skill_prompt
 from .tools import ToolRunner, format_tool_result
@@ -114,6 +116,9 @@ class Agent:
             self.tools.set_subagent_executor(self._run_subagents)
         self.tool_schemas = self.tools.tool_schemas
         self._tool_token_estimate: int | None = None
+        self.usage: dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0}
+        self.changed_files: set[str] = set()
+        self._duration_ms = 0.0
         self.messages: list[dict[str, Any]] = []
         self._init_system_prompt()
         # Skills load on the first turn of a fresh session (not when continuing
@@ -140,11 +145,16 @@ class Agent:
 
     def _init_system_prompt(self) -> None:
         base = self.config.system_prompt or DEFAULT_SYSTEM_PROMPT
+        rules = load_rules(str(self.tools.workdir), getattr(self.config, "rules", ""))
+        if rules:
+            base = base.rstrip() + "\n\n" + rules
         self.messages.append({"role": "system", "content": base})
 
     # -- public API ----------------------------------------------------------
     def run(self, task: str) -> str:
         """Run the agent on one task; returns the model's final answer."""
+        started = time.monotonic()
+        self._duration_ms = 0.0
         safe_task = redact(task)
         if safe_task != task:
             self._progress("[security] redacted potential secrets from the task")
@@ -160,26 +170,36 @@ class Agent:
 
         for step in range(1, self.config.max_iterations + 1):
             self.messages = self._manage_context(self.messages)
+            llm_started = time.monotonic()
             try:
                 reply = self._call_llm()
             except LLMError as exc:
+                self._duration_ms = (time.monotonic() - started) * 1000
                 raise AgentError(f"LLM call failed: {exc.message}") from exc
+            llm_ms = (time.monotonic() - llm_started) * 1000
+            self._record_usage(getattr(reply, "usage", {}) or {})
 
             self.messages.append(reply.to_api_dict())
             self._show_step(step, reply)
 
             if not reply.tool_calls:
                 if getattr(reply, "finish_reason", "") == "tool_calls":
+                    self._duration_ms = (time.monotonic() - started) * 1000
                     raise AgentError(
                         "the model returned finish_reason='tool_calls' without "
                         "any tool calls; refusing to treat that as a final answer"
                     )
                 final_answer = reply.content or "(the model returned no text)"
+                self._progress(
+                    f"[answer] llm {llm_ms / 1000:.2f}s · "
+                    f"total {self._duration_ms / 1000:.2f}s"
+                )
                 break
 
             signature: list[tuple[str, str, str]] = []
             calls = reply.tool_calls
             parallel_results: dict[int, dict[str, Any]] = {}
+            tool_started = time.monotonic()
             if len(calls) > 1 and all(tc.name in _READ_ONLY_TOOLS for tc in calls):
                 parallel_results = self._run_read_only_parallel(calls)
             for idx, tc in enumerate(calls):
@@ -203,20 +223,24 @@ class Agent:
                         "content": format_tool_result(result),
                     }
                 )
-                self._show_tool_end(result)
+                self._record_changed_file(tc.name, result)
+                self._show_tool_end(result, (time.monotonic() - tool_started) * 1000, llm_ms)
 
             signatures.append(tuple(signature))
             if self._is_stuck(signatures):
+                self._duration_ms = (time.monotonic() - started) * 1000
                 raise AgentError(
                     "the model repeated the same tool call with no observable "
                     "progress; aborting to avoid an infinite loop"
                 )
         else:
+            self._duration_ms = (time.monotonic() - started) * 1000
             raise MaxIterationsExceeded(
                 f"reached max_iterations ({self.config.max_iterations}) "
                 "without a final answer"
             )
 
+        self._duration_ms = (time.monotonic() - started) * 1000
         return final_answer
 
     def _run_read_only_parallel(
@@ -228,6 +252,50 @@ class Agent:
 
         with ThreadPoolExecutor(max_workers=min(8, len(calls))) as ex:
             return dict(ex.map(run_one, enumerate(calls)))
+
+    # -- stats ---------------------------------------------------------------
+    @property
+    def duration_ms(self) -> float:
+        return self._duration_ms
+
+    @property
+    def total_tokens(self) -> int:
+        return self.usage.get("prompt_tokens", 0) + self.usage.get("completion_tokens", 0)
+
+    @property
+    def stats(self) -> dict[str, Any]:
+        return {
+            "duration_ms": round(self._duration_ms, 1),
+            "prompt_tokens": self.usage.get("prompt_tokens", 0),
+            "completion_tokens": self.usage.get("completion_tokens", 0),
+            "total_tokens": self.total_tokens,
+            "changed_files": sorted(self.changed_files),
+        }
+
+    def _record_usage(self, usage: dict[str, Any]) -> None:
+        try:
+            self.usage["prompt_tokens"] += int(usage.get("prompt_tokens") or 0)
+            self.usage["completion_tokens"] += int(usage.get("completion_tokens") or 0)
+        except (TypeError, ValueError):
+            pass
+
+    def _record_changed_file(self, tool_name: str, result: dict[str, Any]) -> None:
+        if (
+            tool_name in ("write_file", "edit_file")
+            and result.get("ok")
+            and result.get("diff")
+        ):
+            path = result.get("path")
+            if path:
+                self.changed_files.add(path)
+
+    def compact_now(self) -> tuple[int, int]:
+        """Force a compaction pass now (used by the REPL ``/compact``)."""
+        before = len(self.messages)
+        if before <= 1:
+            return before, before
+        self.messages = self._compact(self.messages)
+        return before, len(self.messages)
 
     def _call_llm(self) -> Any:
         if getattr(self.config, "stream", False):
@@ -272,8 +340,28 @@ class Agent:
             f"{tc.name}({self._fmt_args(tc.arguments)})"
         )
 
-    def _show_tool_end(self, result: dict[str, Any]) -> None:
-        self._progress(f"  {self._result_summary(result)}")
+    def _show_tool_end(
+        self,
+        result: dict[str, Any],
+        tool_ms: float | None = None,
+        llm_ms: float | None = None,
+    ) -> None:
+        summary = self._result_summary(result)
+        timing = ""
+        if tool_ms is not None:
+            timing += f" · tool {tool_ms / 1000:.2f}s"
+        if llm_ms is not None:
+            timing += f" · llm {llm_ms / 1000:.2f}s"
+        self._progress(f"  {summary}{timing}")
+        diff = result.get("diff") or ""
+        if diff:
+            path = result.get("path") or ""
+            added = result.get("added_lines", 0)
+            removed = result.get("removed_lines", 0)
+            self._progress(f"  ~ {path} +{added} -{removed}")
+            if self.config.verbose:
+                for line in diff.splitlines()[:40]:
+                    self._progress(f"    {line}")
 
     # -- context management ---------------------------------------------------
     def _estimate_tokens(self, messages: list[dict[str, Any]]) -> int:

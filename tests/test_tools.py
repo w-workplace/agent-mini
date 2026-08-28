@@ -181,5 +181,20 @@ class ToolRunnerTestCase(unittest.TestCase):
         self.assertTrue(res.get("truncated"))
 
 
+    def test_write_file_returns_diff(self):
+        self.runner.write_file("f.txt", "one\n")
+        res = self.runner.write_file("f.txt", "one\ntwo\n")
+        self.assertTrue(res["ok"])
+        self.assertIn("+two", res["diff"])
+        self.assertEqual(res["added_lines"], 1)
+
+    def test_edit_file_returns_diff(self):
+        self.runner.write_file("f.txt", "a\nb\n")
+        res = self.runner.edit_file("f.txt", "a", "A")
+        self.assertTrue(res["ok"])
+        self.assertIn("-a", res["diff"])
+        self.assertIn("+A", res["diff"])
+
+
 if __name__ == "__main__":
     unittest.main()

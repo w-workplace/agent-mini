@@ -299,6 +299,28 @@ class AgentUnitTestCase(unittest.TestCase):
         with self.assertRaises(AgentError):
             agent.run("task")
 
+    def test_usage_and_changed_files_are_recorded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Config(
+                api_key="k", model="m", workdir=tmp,
+                stream=False, subagents=False, skills=False,
+            )
+            agent = Agent(config, llm=_StubLLMWithWriteThenUsage())
+            agent.run("write greeting")
+            self.assertEqual(agent.usage["prompt_tokens"], 10)
+            self.assertEqual(agent.usage["completion_tokens"], 4)
+            self.assertIn("greeting.txt", agent.changed_files)
+
+    def test_project_rules_loaded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "AGENTS.md").write_text("Always use pytest.\n")
+            config = Config(
+                api_key="k", model="m", workdir=tmp,
+                stream=False, subagents=False, skills=False,
+            )
+            agent = Agent(config, llm=_StubLLMWithFinishReason("stop"))
+            self.assertIn("Always use pytest.", agent.messages[0]["content"])
+
     def test_is_stuck_ignores_different_results(self):
         a = (("grep", "{}", "result-a"),)
         b = (("grep", "{}", "result-b"),)
@@ -334,6 +356,26 @@ class CompactionTestCase(unittest.TestCase):
         self.assertEqual(out[1]["role"], "user")
         self.assertLessEqual(agent._estimate_tokens(out), 500)
 
+
+
+class _StubLLMWithWriteThenUsage:
+    def __init__(self):
+        self.calls = 0
+
+    def chat(self, messages, tools=None):
+        self.calls += 1
+        if self.calls == 1:
+            return LLMClient("https://x/v1", "k", "m")._parse(
+                tool_call_response(
+                    "write_file",
+                    {"path": "greeting.txt", "content": "hello"},
+                    "call_1",
+                )
+            )
+        return AssistantMessage(
+            content="done",
+            usage={"prompt_tokens": 10, "completion_tokens": 4},
+        )
 
 
 class _StubLLMWithFinishReason:

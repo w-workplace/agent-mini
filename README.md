@@ -94,9 +94,9 @@ memorable:
 ```console
 coding-agent "task"              # run a task (new session)          [= run]
 coding-agent run "task" [-M msg] # explicit; `run` with no args reads stdin
-coding-agent status              # workspace / branch / HEAD
+coding-agent status              # workspace / branch / HEAD + work/ diff
 coding-agent log [--all] [--graph] [--oneline]   # session history (DAG)
-coding-agent show <ref> [--all]  # view a session's conversation (last 20 msgs)
+coding-agent show <ref> [--all] [--diff]  # conversation + artifact diff
 coding-agent switch <ref>        # roll back HEAD (no file changes)
 coding-agent checkout <ref>      # roll back HEAD + restore work/ files
 coding-agent branch [<name>]     # list / create a branch
@@ -104,6 +104,21 @@ coding-agent branch -d <name>    # delete a branch
 coding-agent rm <ref>            # delete a session
 coding-agent repl                # interactive (turns merge into ONE session)
 coding-agent init                # initialize the workspace
+coding-agent doctor              # environment / config / sandbox check
+coding-agent config [show|path|get|set|unset]  # workspace config helper
+coding-agent completion bash     # shell completion snippet
+```
+
+Run shortcuts and safety flags:
+
+```console
+coding-agent --continue "task"        # continue current HEAD session
+coding-agent --resume <ref> "task"    # restore <ref> then run
+coding-agent --plan "task"            # read-only plan, no writes/commands
+coding-agent --ask "task"             # confirm write_file/edit_file/run_command
+coding-agent --json "task"            # machine-readable result on stdout
+coding-agent --file spec.md "task"    # attach file(s) to the task
+coding-agent --rules RULES.md "task"  # extra project rules
 ```
 
 ```console
@@ -113,10 +128,15 @@ printf 'add a README section about testing' | coding-agent run
 - `<ref>` is a branch name or a session id (full or unique prefix).
 - `switch`/`checkout` roll HEAD back (like `git switch`/`git checkout`).
 - `log --graph` renders the session DAG like `git log --graph` (`*` commits,
-  `|` lines, `/` `\` forks/merges), with branch/HEAD markers.
+  `|` lines, `/` `\` forks/merges), with branch/HEAD markers. `log` also
+  shows status, duration, token usage and changed-file counts.
+- `status` shows the current session metadata and diffs live `work/` against
+  the HEAD artifact snapshot.
+- `show --diff` prints a path/file diff against the parent session snapshot.
 - `repl` merges every turn into **one** session (sealed when you exit), rather
   than recording a session per turn. `/save` inside the REPL seals a
-  checkpoint session and continues from it.
+  checkpoint session and continues from it. Other REPL commands:
+  `/tokens`, `/diff`, `/undo`, `/checkout REF`, `/compact`, `/skills`.
 - A failed run (LLM error, `max_iterations`, repeat guard) is still sealed as
   a session with `status: "failed"` and the error recorded in `meta.json`, so
   the partial workdir/conversation is never lost.
@@ -146,9 +166,10 @@ the untracked workspace `config.json`; never commit them.
 Key options (env `LLM_<UPPER>` / CLI): `max_iterations`, `context_limit_tokens`,
 `compact`, `max_tokens`, `temperature`, `timeout`, `command_timeout`, `sandbox`,
 `env_allow`, `subagents`, `subagent_parallel`, `stream`, `skills`, `max_skills`,
-`snapshot`, `allow_outside_workdir`, `allow_dangerous_commands`, `verbose`,
-`quiet`, `minimal`. All boolean flags accept both forms, e.g. `--sandbox` /
-`--no-sandbox`, `--stream` / `--no-stream`. Additional model-API HTTP headers
+`snapshot`, `plan`, `ask`, `rules`, `allow_outside_workdir`,
+`allow_dangerous_commands`, `verbose`, `quiet`, `minimal`. All boolean flags
+accept both forms, e.g. `--sandbox` / `--no-sandbox`, `--stream` /
+`--no-stream`, `--plan` / `--no-plan`. Additional model-API HTTP headers
 can be set with repeated `--header 'Name: value'` flags, the
 `LLM_EXTRA_HEADERS` environment variable, or the `extra_headers` JSON object
 in a config file.
@@ -161,12 +182,14 @@ answer stays on stdout for scripting):
 ```
 [run] branch main · model gpt-4o-mini · ~/.coding-agent/work
 [step 1/40] list_files({"pattern": "*"})
-  ok (count=0)
+  ok (count=0) · tool 0.01s
 [step 2/40] write_file({"path": "greeting.txt", ...})
-  ok (bytes_written=6)
+  ok (bytes_written=6) · tool 0.01s
+  ~ greeting.txt +1 -0
 [step 3/40] run_command("cat greeting.txt")
-  ok (exit_code=0)
-[session 530576fc9b04d7e2] on branch main
+  ok (exit_code=0) · tool 0.02s
+[answer] llm 0.8s · total 3.4s
+[session 530576fc9b04d7e2] on branch main · changed greeting.txt
 ```
 
 The current branch is shown in the run header/footer, in `status`, and in the
@@ -195,6 +218,9 @@ interim assistant text, or `--quiet` to suppress the progress stream entirely.
 - `--allow-outside-workdir` — let file tools touch paths outside `workdir`.
 - `--allow-dangerous-commands` — allow the blocked destructive-command patterns
   (`rm -rf /`, `mkfs`, fork bombs, …).
+- `--plan` — read-only planning mode; only list/read/grep tools are exposed.
+- `--ask` — confirm every `write_file` / `edit_file` / `run_command` before it
+  runs (`y` yes, `a` approve all, anything else denies).
 
 `--workdir DIR` overrides the working directory (default `<workspace>/work`).
 Artifact snapshots are only taken for the default workspace `work/` directory;
@@ -203,6 +229,25 @@ use `--no-snapshot` to disable them entirely.
 > These are best-effort, defense-in-depth measures. The only real security
 > boundary is a dedicated OS-level sandbox (container / VM) — run the agent
 > inside one for untrusted work.
+
+## Usability & readability
+
+- Per-step LLM/tool timings, token usage and changed-file summaries are
+  printed to stderr; `--json` emits the full result as one JSON object.
+- `write_file`/`edit_file` display `+/-` diff summaries (`--verbose` shows the
+  unified diff).
+- `log` marks `ok` / `failed` / `plan` sessions and shows duration/tokens/files.
+- `show` prints a readable conversation transcript and `--diff` shows file
+  content diffs vs the parent snapshot.
+- `status` reports whether live `work/` differs from the HEAD snapshot.
+- Project rules are auto-loaded from `AGENTS.md`, `CODING_AGENT.md`,
+  `CLAUDE.md`, or `.coding-agent/rules.md` in the workdir; add explicit files
+  with `--rules`.
+- `@path` references inside a task are expanded to file contents; `--file`
+  attaches additional files.
+- `doctor` checks workspace/config/sandbox/ripgrep; `config` edits the
+  workspace `config.json` without leaving the CLI.
+- Subcommand help is available: `coding-agent run --help`, `show --help`, etc.
 
 ## Performance
 
@@ -290,6 +335,7 @@ coding_agent/
 ├── security.py # sandbox, env scrubbing, secret redaction
 ├── subagent.py # read-only, parallel exploration subagents
 ├── skills.py   # agent skills: discovery + injection
+├── rules.py    # AGENTS.md / project rule loading
 ├── default_skills/  # preset skills (git-commit, testing, code-review, …)
 ├── store.py    # workspace/session/branch/HEAD store (git-like DAG)
 ├── graph.py    # git-log --graph style DAG rendering
@@ -316,7 +362,7 @@ endpoint:
 python -m unittest discover -s tests -v
 ```
 
-126 tests cover every tool executor, config precedence, LLM parsing/streaming/retry, the
+140 tests cover every tool executor, config precedence, LLM parsing/streaming/retry, the
 full agent loop end-to-end, context compaction, the session/branch store (DAG,
 guards, artifacts), DAG graph rendering, and the CLI run/REPL flow (including failed-run recovery, /save checkpoints, stdin tasks, large-file paging, and bounded command capture).
 
