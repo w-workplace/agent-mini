@@ -43,6 +43,9 @@ in a dedicated workspace folder, with branches and rollback.
 | **Session/workspace management** | `coding_agent/store.py` (sessions, branches, HEAD) |
 | **Cache-friendly context** | constant system prompt + append-only history + compaction |
 | **Security** | `coding_agent/security.py` (sandbox, env scrubbing, redaction) |
+| **Subagents** | `coding_agent/subagent.py` (read-only, parallel exploration) |
+| **Streaming** | `LLMClient.chat_stream` + live command output |
+| **Agent Skills** | `coding_agent/skills.py` + `default_skills/` (preset skills) |
 
 ---
 
@@ -134,8 +137,8 @@ the untracked workspace `config.json`; never commit them.
 
 Key options (env `LLM_<UPPER>` / CLI): `max_iterations`, `context_limit_tokens`,
 `compact`, `max_tokens`, `temperature`, `command_timeout`, `sandbox`,
-`env_allow`, `allow_outside_workdir`, `allow_dangerous_commands`, `verbose`,
-`quiet`.
+`env_allow`, `subagents`, `subagent_parallel`, `stream`, `skills`, `max_skills`,
+`allow_outside_workdir`, `allow_dangerous_commands`, `verbose`, `quiet`.
 
 ### Progress & branch display
 
@@ -185,6 +188,35 @@ interim assistant text, or `--quiet` to suppress the progress stream entirely.
 > boundary is a dedicated OS-level sandbox (container / VM) — run the agent
 > inside one for untrusted work.
 
+## Subagents, streaming & skills
+
+**Subagents (parallel search)** — the model can call `parallel_search` to
+delegate several independent exploration subtasks to isolated **read-only**
+subagents (list/read/grep only, no writes or commands) that run in parallel and
+return concise summaries. This keeps the main context clean and speeds up broad
+investigation. Disable with `--no-subagents`, tune with `--subagent-parallel N`.
+
+**Streaming** — assistant text streams to stdout live, and `run_command`
+output streams to stderr in real time (instead of only appearing when the
+command finishes). Disable with `--no-stream`.
+
+**Agent Skills** — keyword-matched instruction bundles loaded on demand. A
+skill is a markdown file with a small frontmatter header; at the start of a
+session, the task is matched against each skill's keywords and matching skills'
+instructions are injected (after the system prompt, keeping it constant for
+cache). Built-in presets ship in `coding_agent/default_skills/`:
+
+- `git-commit` — Conventional Commits and tidy git history
+- `testing` — write/run tests, treat failures as truth
+- `code-review` — review diffs for bugs/edge cases
+- `security-review` — audit for injection, secrets, unsafe subprocess use
+- `python-style` — PEP 8, type hints, linting
+- `documentation` — README, docstrings, usage guides
+
+Add your own in `<workspace>/skills/<name>.md` (a `---` frontmatter block with
+`name` / `description` / `keywords` and a markdown body). Disable with
+`--no-skills`, cap with `--max-skills N`.
+
 ## Cache-friendly context management
 
 Prompt caches (Anthropic prompt caching, OpenAI/DeepSeek automatic prefix
@@ -209,9 +241,12 @@ follows three rules to keep hit rates high:
 coding_agent/
 ├── cli.py      # argparse CLI + git-like subcommands + REPL
 ├── config.py   # defaults ← project config ← workspace config ← env ← CLI
-├── llm.py      # OpenAI-compatible HTTP client, retry, response parsing
+├── llm.py      # OpenAI-compatible HTTP client, retry, streaming, parsing
 ├── tools.py    # tool JSON schemas + local executors + safety guards
 ├── security.py # sandbox, env scrubbing, secret redaction
+├── subagent.py # read-only, parallel exploration subagents
+├── skills.py   # agent skills: discovery + injection
+├── default_skills/  # preset skills (git-commit, testing, code-review, …)
 ├── store.py    # workspace/session/branch/HEAD store (git-like DAG)
 ├── graph.py    # git-log --graph style DAG rendering
 ├── agent.py    # the loop + context compaction/trimming + termination
@@ -236,7 +271,7 @@ endpoint:
 python -m unittest discover -s tests -v
 ```
 
-90 tests cover every tool executor, config precedence, LLM parsing/retry, the
+105 tests cover every tool executor, config precedence, LLM parsing/streaming/retry, the
 full agent loop end-to-end, context compaction, the session/branch store (DAG,
 guards, artifacts), DAG graph rendering, and the CLI run/REPL flow.
 

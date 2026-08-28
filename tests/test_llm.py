@@ -1,6 +1,7 @@
-"""Tests for the LLM client: response parsing and transient-error retry."""
+"""Tests for the LLM client: response parsing, streaming, and retry."""
 
 import unittest
+from unittest import mock
 
 from coding_agent.llm import AssistantMessage, LLMClient, LLMError
 
@@ -114,6 +115,48 @@ class LLMRetryTestCase(unittest.TestCase):
                 client.chat([{"role": "user", "content": "hi"}])
         finally:
             server.shutdown()
+
+
+class _FakeResponse:
+    def __init__(self, lines):
+        self.lines = lines
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def __iter__(self):
+        return iter(self.lines)
+
+    def read(self):
+        return b""
+
+
+class StreamingTestCase(unittest.TestCase):
+    def test_chat_stream_sse(self):
+        lines = [
+            b'data: {"choices":[{"delta":{"content":"Hello"},"finish_reason":null}]}\n',
+            b'data: {"choices":[{"delta":{"content":" world"},"finish_reason":null}]}\n',
+            b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n',
+            b"data: [DONE]\n",
+        ]
+        client = LLMClient("https://x/v1", "k", "m")
+        got = []
+        with mock.patch("coding_agent.llm.urllib.request.urlopen", return_value=_FakeResponse(lines)):
+            msg = client.chat_stream([{"role": "user", "content": "hi"}], on_text=got.append)
+        self.assertEqual(msg.content, "Hello world")
+        self.assertEqual("".join(got), "Hello world")
+
+    def test_chat_stream_non_streaming_fallback(self):
+        body = b'{"choices":[{"index":0,"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}]}'
+        client = LLMClient("https://x/v1", "k", "m")
+        got = []
+        with mock.patch("coding_agent.llm.urllib.request.urlopen", return_value=_FakeResponse([body])):
+            msg = client.chat_stream([{"role": "user", "content": "hi"}], on_text=got.append)
+        self.assertEqual(msg.content, "done")
+        self.assertEqual(got, ["done"])
 
 
 if __name__ == "__main__":

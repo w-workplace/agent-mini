@@ -40,6 +40,11 @@ DEFAULTS: dict[str, Any] = {
     "compact": False,  # summarize oldest turns instead of dropping them
     "sandbox": False,  # run commands in a network-less, read-only-root sandbox
     "env_allow": "",   # extra (comma-separated) env vars to pass to commands
+    "subagents": True,  # allow delegating to read-only subagents (parallel_search)
+    "subagent_parallel": 4,  # max concurrent subagents
+    "stream": True,  # stream assistant text and command output live
+    "skills": True,  # auto-load keyword-matched agent skills
+    "max_skills": 3,  # max skills to inject per session
     "verbose": False,
     "quiet": False,  # suppress progress output
     "system_prompt": "",
@@ -62,6 +67,8 @@ _ENV_CASTERS: dict[str, Callable[[str], Any]] = {
     "request_retries": int,
     "context_limit_tokens": int,
     "command_timeout": float,
+    "subagent_parallel": int,
+    "max_skills": int,
 }
 
 
@@ -74,6 +81,9 @@ _BOOLEAN_CASTERS: dict[str, Callable[[str], bool]] = {
     "allow_dangerous_commands": _parse_bool,
     "compact": _parse_bool,
     "sandbox": _parse_bool,
+    "subagents": _parse_bool,
+    "stream": _parse_bool,
+    "skills": _parse_bool,
     "verbose": _parse_bool,
     "quiet": _parse_bool,
 }
@@ -98,6 +108,11 @@ class Config:
     compact: bool = False
     sandbox: bool = False
     env_allow: str = ""
+    subagents: bool = True
+    subagent_parallel: int = 4
+    stream: bool = True
+    skills: bool = True
+    max_skills: int = 3
     verbose: bool = False
     quiet: bool = False
     system_prompt: str = ""

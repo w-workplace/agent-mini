@@ -85,29 +85,8 @@ class LLMClient:
         self.retries = retries
         self.verbose = verbose
 
-    def _request(self, payload: dict[str, Any]) -> dict[str, Any]:
-        url = self.base_url + "/chat/completions"
-        data = json.dumps(payload).encode("utf-8")
-        headers = {"Content-Type": "application/json"}
-        if self.api_key:
-            headers["Authorization"] = "Bearer " + self.api_key
-        req = urllib.request.Request(url, data=data, method="POST", headers=headers)
-        try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                body = resp.read().decode("utf-8")
-                return json.loads(body)
-        except urllib.error.HTTPError as exc:
-            raw = exc.read().decode("utf-8", "replace")
-            raise LLMError(exc.code, f"HTTP {exc.code} from the model API", raw) from exc
-        except urllib.error.URLError as exc:
-            raise LLMError(None, f"connection error: {exc.reason}") from exc
-
-    def chat(self, messages: list[dict[str, Any]], tools: list[dict] | None = None) -> AssistantMessage:
-        """Send the conversation and tool schemas, return the parsed reply."""
-        payload: dict[str, Any] = {
-            "model": self.model,
-            "messages": messages,
-        }
+    def _payload(self, messages: list[dict[str, Any]], tools: list[dict] | None) -> dict[str, Any]:
+        payload: dict[str, Any] = {"model": self.model, "messages": messages}
         if self.temperature is not None:
             payload["temperature"] = self.temperature
         if self.max_tokens and self.max_tokens > 0:
@@ -115,27 +94,136 @@ class LLMClient:
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
+        return payload
 
+    def _build_request(self, payload: dict[str, Any]) -> urllib.request.Request:
+        url = self.base_url + "/chat/completions"
+        data = json.dumps(payload).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = "Bearer " + self.api_key
+        return urllib.request.Request(url, data=data, method="POST", headers=headers)
+
+    def _open(self, req: urllib.request.Request):
+        try:
+            return urllib.request.urlopen(req, timeout=self.timeout)
+        except urllib.error.HTTPError as exc:
+            raw = exc.read().decode("utf-8", "replace")
+            raise LLMError(exc.code, f"HTTP {exc.code} from the model API", raw) from exc
+        except urllib.error.URLError as exc:
+            raise LLMError(None, f"connection error: {exc.reason}") from exc
+
+    def _retry(self, exc: LLMError, attempt: int) -> bool:
+        transient = exc.status in _TRANSIENT_STATUS or exc.status is None
+        if not transient or attempt >= self.retries:
+            return False
+        delay = (2 ** attempt) + random.uniform(0, 0.5)
+        if self.verbose:
+            print(
+                f"[llm] transient error (status={exc.status}); retrying in {delay:.1f}s",
+                file=sys.stderr,
+            )
+        time.sleep(delay)
+        return True
+
+    def chat(self, messages: list[dict[str, Any]], tools: list[dict] | None = None) -> AssistantMessage:
+        """Send the conversation and tool schemas, return the parsed reply."""
+        payload = self._payload(messages, tools)
         last_error: LLMError | None = None
         for attempt in range(self.retries + 1):
             try:
-                data = self._request(payload)
+                with self._open(self._build_request(payload)) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
                 return self._parse(data)
             except LLMError as exc:
                 last_error = exc
-                transient = exc.status in _TRANSIENT_STATUS or exc.status is None
-                if not transient or attempt >= self.retries:
-                    raise
-                delay = (2 ** attempt) + random.uniform(0, 0.5)
-                if self.verbose:
-                    print(
-                        f"[llm] transient error (status={exc.status}); "
-                        f"retrying in {delay:.1f}s",
-                        file=sys.stderr,
-                    )
-                time.sleep(delay)
-        # Unreachable, but keeps type checkers happy.
+                if self._retry(exc, attempt):
+                    continue
+                raise
         raise last_error  # type: ignore[misc]
+
+    def chat_stream(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict] | None = None,
+        on_text: Any = None,
+    ) -> AssistantMessage:
+        """Stream a completion, calling ``on_text(delta)`` for content deltas.
+
+        Handles both a real SSE stream and (for compatibility with gateways and
+        tests) a plain non-streaming JSON response. Returns the accumulated
+        :class:`AssistantMessage` (including any tool calls).
+        """
+        payload = self._payload(messages, tools)
+        payload["stream"] = True
+        last_error: LLMError | None = None
+        for attempt in range(self.retries + 1):
+            try:
+                return self._read_stream(self._build_request(payload), on_text)
+            except LLMError as exc:
+                last_error = exc
+                if self._retry(exc, attempt):
+                    continue
+                raise
+        raise last_error  # type: ignore[misc]
+
+    def _read_stream(self, req: urllib.request.Request, on_text: Any) -> AssistantMessage:
+        content_parts: list[str] = []
+        tool_calls: dict[int, dict[str, str]] = {}
+        finish_reason = ""
+        first = True
+        with self._open(req) as resp:
+            for raw in resp:
+                line = raw.decode("utf-8", "replace")
+                if first:
+                    first = False
+                    # A gateway may ignore `stream` and return plain JSON.
+                    if not line.lstrip().startswith("data:"):
+                        body = line + resp.read().decode("utf-8", "replace")
+                        msg = self._parse(json.loads(body))
+                        if on_text and msg.content:
+                            on_text(msg.content)
+                        return msg
+                s = line.strip()
+                if not s or s.startswith(":"):
+                    continue
+                if s.startswith("data:"):
+                    data_str = s[len("data:"):].strip()
+                    if data_str == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data_str)
+                    except json.JSONDecodeError:
+                        continue
+                    choice = (chunk.get("choices") or [{}])[0]
+                    delta = choice.get("delta") or {}
+                    if delta.get("content"):
+                        content_parts.append(delta["content"])
+                        if on_text:
+                            on_text(delta["content"])
+                    for tc in delta.get("tool_calls") or []:
+                        idx = tc.get("index", 0)
+                        entry = tool_calls.setdefault(idx, {"id": "", "name": "", "arguments": ""})
+                        if tc.get("id"):
+                            entry["id"] = tc["id"]
+                        fn = tc.get("function") or {}
+                        if fn.get("name"):
+                            entry["name"] = fn["name"]
+                        if fn.get("arguments"):
+                            entry["arguments"] += fn["arguments"]
+                    if choice.get("finish_reason"):
+                        finish_reason = choice["finish_reason"]
+
+        content = "".join(content_parts)
+        parsed_calls: list[ToolCall] = []
+        for idx in sorted(tool_calls):
+            entry = tool_calls[idx]
+            try:
+                args = json.loads(entry["arguments"]) if entry["arguments"] else {}
+            except json.JSONDecodeError:
+                args = {"_raw": entry["arguments"], "_error": "invalid JSON arguments"}
+            parsed_calls.append(ToolCall(entry["id"], entry["name"], args))
+        return AssistantMessage(content=content, tool_calls=parsed_calls, finish_reason=finish_reason)
 
     def _parse(self, data: dict[str, Any]) -> AssistantMessage:
         try:

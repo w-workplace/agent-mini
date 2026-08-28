@@ -27,7 +27,8 @@ import sys
 from typing import Any
 
 from .llm import LLMClient, LLMError
-from .tools import TOOL_SCHEMAS, ToolRunner, format_tool_result
+from .skills import discover_skills, load_skills, skill_prompt
+from .tools import ToolRunner, format_tool_result
 
 DEFAULT_SYSTEM_PROMPT = """\
 You are a coding agent: an autonomous software-engineering assistant.
@@ -96,14 +97,38 @@ class Agent:
             allow_outside_workdir=config.allow_outside_workdir,
             allow_dangerous_commands=config.allow_dangerous_commands,
             command_timeout=config.command_timeout,
+            sandbox=config.sandbox,
+            env_allow=config.env_allow,
+            stream=config.stream,
+            quiet=config.quiet,
         )
+        # Wire subagent support: adds the `parallel_search` tool when enabled.
+        if config.subagents and not getattr(self.tools, "read_only", False):
+            self.tools.set_subagent_executor(self._run_subagents)
+        self.tool_schemas = self.tools.tool_schemas
         self.messages: list[dict[str, Any]] = []
         self._init_system_prompt()
+        # Skills load on the first turn of a fresh session (not when continuing
+        # a parent session, whose history already contains any injected skills).
+        self.skills = load_skills(config.workspace) if config.skills else []
+        self._skills_pending = bool(config.skills) and not history
         if history:
             # `history` is the parent session's messages *without* the system
             # prompt, so the reconstructed prefix is [system] + history and the
             # system prompt stays byte-identical across sessions (cache hit).
             self.messages.extend(history)
+
+    def _run_subagents(self, queries: list[str]) -> list[dict[str, Any]]:
+        from .subagent import run_subagents
+        return run_subagents(
+            self.llm, self.config, str(self.tools.workdir), queries,
+            max_parallel=self.config.subagent_parallel,
+        )
+
+    def _stream_delta(self, text: str) -> None:
+        """Write streamed assistant text to stdout (live final answer)."""
+        sys.stdout.write(text)
+        sys.stdout.flush()
 
     def _init_system_prompt(self) -> None:
         base = self.config.system_prompt or DEFAULT_SYSTEM_PROMPT
@@ -112,6 +137,11 @@ class Agent:
     # -- public API ----------------------------------------------------------
     def run(self, task: str) -> str:
         """Run the agent on one task; returns the model's final answer."""
+        if self._skills_pending:
+            self._skills_pending = False
+            for skill in discover_skills(task, self.skills, self.config.max_skills):
+                self.messages.append({"role": "user", "content": skill_prompt(skill)})
+                self._progress(f"[skill] loaded {skill.name}")
         self.messages.append({"role": "user", "content": task})
         signatures: list[tuple[tuple[str, str], ...]] = []
         final_answer = ""
@@ -119,7 +149,7 @@ class Agent:
         for step in range(1, self.config.max_iterations + 1):
             self.messages = self._manage_context(self.messages)
             try:
-                reply = self.llm.chat(self.messages, TOOL_SCHEMAS)
+                reply = self._call_llm()
             except LLMError as exc:
                 raise AgentError(f"LLM call failed: {exc.message}") from exc
 
@@ -157,6 +187,11 @@ class Agent:
             )
 
         return final_answer
+
+    def _call_llm(self) -> Any:
+        if getattr(self.config, "stream", False):
+            return self.llm.chat_stream(self.messages, self.tool_schemas, on_text=self._stream_delta)
+        return self.llm.chat(self.messages, self.tool_schemas)
 
     # -- progress output ------------------------------------------------------
     def _progress(self, message: str) -> None:

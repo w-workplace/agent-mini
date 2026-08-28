@@ -15,6 +15,8 @@ import json
 import os
 import re
 import subprocess
+import sys
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -190,6 +192,30 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "parallel_search",
+            "description": (
+                "Delegate several independent research/exploration subtasks to "
+                "isolated read-only subagents that run in parallel and return "
+                "concise summaries. Use this to explore a large codebase (find "
+                "where something is defined, how modules are structured) without "
+                "polluting the main conversation with large file contents."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "queries": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of independent, self-contained subtasks/questions.",
+                    },
+                },
+                "required": ["queries"],
+            },
+        },
+    },
 ]
 
 
@@ -198,6 +224,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
 _EXECUTOR_NAMES = frozenset({
     "list_files", "read_file", "write_file", "edit_file", "grep", "run_command",
 })
+_READ_ONLY_NAMES = frozenset({"list_files", "read_file", "grep"})
 
 
 class ToolRunner:
@@ -211,6 +238,10 @@ class ToolRunner:
         command_timeout: float = 120.0,
         sandbox: bool = False,
         env_allow: str = "",
+        read_only: bool = False,
+        stream: bool = True,
+        quiet: bool = False,
+        subagent_executor: Any = None,
     ):
         self.workdir = Path(workdir).resolve()
         self.allow_outside_workdir = allow_outside_workdir
@@ -218,10 +249,31 @@ class ToolRunner:
         self.command_timeout = command_timeout
         self.sandbox = sandbox
         self.env_allow = env_allow
+        self.read_only = read_only
+        self.stream = stream
+        self.quiet = quiet
+        self.subagent_executor = subagent_executor
         self.sandbox_backend = detect_sandbox_backend() if sandbox else None
-        # Explicit allowlist: only these callables are reachable from the model.
-        self._executors = {name: getattr(self, name) for name in _EXECUTOR_NAMES}
         self._schemas = {s["function"]["name"]: s["function"] for s in TOOL_SCHEMAS}
+        self._executors: dict[str, Any] = {}
+        self._rebuild_executors()
+
+    def _rebuild_executors(self) -> None:
+        """Explicit allowlist: only these callables are reachable from the model."""
+        names: set[str] = set(_READ_ONLY_NAMES) if self.read_only else set(_EXECUTOR_NAMES)
+        if not self.read_only and self.subagent_executor is not None:
+            names.add("parallel_search")
+        self._executors = {name: getattr(self, name) for name in names}
+
+    @property
+    def tool_schemas(self) -> list[dict[str, Any]]:
+        return [s for s in TOOL_SCHEMAS if s["function"]["name"] in self._executors]
+
+    def set_subagent_executor(self, executor: Any) -> None:
+        """Enable the ``parallel_search`` tool by wiring a subagent executor."""
+        self.subagent_executor = executor
+        if not self.read_only:
+            self._rebuild_executors()
 
     # -- helpers ------------------------------------------------------------
     @staticmethod
@@ -429,29 +481,68 @@ class ToolRunner:
             run_kwargs = dict(args=command, shell=True)
 
         try:
-            proc = subprocess.run(
-                cwd=str(self.workdir),
-                capture_output=True,
-                text=True,
-                timeout=limit,
-                env=env,
-                **run_kwargs,
-            )
+            if self.stream and not self.quiet:
+                exit_code, out, err = self._run_streaming(run_kwargs, env, limit)
+            else:
+                exit_code, out, err = self._run_captured(run_kwargs, env, limit)
         except subprocess.TimeoutExpired:
             return self._err(f"command timed out after {limit}s")
         except OSError as exc:
             return self._err(f"failed to run command: {exc}")
 
-        out = proc.stdout or ""
-        err = proc.stderr or ""
         res = self._ok(
-            exit_code=proc.returncode,
+            exit_code=exit_code,
             stdout=out[-MAX_OUTPUT_BYTES:],
             stderr=err[-MAX_OUTPUT_BYTES:],
         )
         if len(out) > MAX_OUTPUT_BYTES or len(err) > MAX_OUTPUT_BYTES:
             res["truncated"] = True
         return res
+
+    def _run_captured(self, run_kwargs: dict[str, Any], env: dict[str, str], limit: float) -> tuple[int, str, str]:
+        proc = subprocess.run(
+            cwd=str(self.workdir),
+            capture_output=True,
+            text=True,
+            timeout=limit,
+            env=env,
+            **run_kwargs,
+        )
+        return proc.returncode, proc.stdout or "", proc.stderr or ""
+
+    def _run_streaming(self, run_kwargs: dict[str, Any], env: dict[str, str], limit: float) -> tuple[int, str, str]:
+        """Run a command, streaming its output live while also capturing it."""
+        proc = subprocess.Popen(
+            cwd=str(self.workdir),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+            **run_kwargs,
+        )
+        out_parts: list[str] = []
+        err_parts: list[str] = []
+
+        def pump(pipe: Any, parts: list[str]) -> None:
+            for line in iter(pipe.readline, ""):
+                parts.append(line)
+                sys.stderr.write(line)
+                sys.stderr.flush()
+
+        t1 = threading.Thread(target=pump, args=(proc.stdout, out_parts), daemon=True)
+        t2 = threading.Thread(target=pump, args=(proc.stderr, err_parts), daemon=True)
+        t1.start()
+        t2.start()
+        try:
+            proc.wait(timeout=limit)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            t1.join(timeout=2)
+            t2.join(timeout=2)
+            raise subprocess.TimeoutExpired(run_kwargs.get("args"), limit)
+        t1.join()
+        t2.join()
+        return proc.returncode, "".join(out_parts), "".join(err_parts)
 
     def _is_dangerous(self, command: str) -> bool:
         if self.allow_dangerous_commands:
@@ -493,7 +584,20 @@ class ToolRunner:
                 return f"{name}: argument {key!r} must be a number"
             if expected == "boolean" and not isinstance(value, bool):
                 return f"{name}: argument {key!r} must be a boolean"
+            if expected == "array" and not isinstance(value, list):
+                return f"{name}: argument {key!r} must be an array"
         return None
+
+    def parallel_search(self, queries: Any) -> dict[str, Any]:
+        """Delegate independent subtasks to read-only subagents (in parallel)."""
+        if self.subagent_executor is None:
+            return self._err("subagents are not available")
+        if not isinstance(queries, list) or not all(isinstance(q, str) and q.strip() for q in queries):
+            return self._err("queries must be a list of non-empty strings")
+        if len(queries) > 16:
+            return self._err("too many subagent queries (max 16)")
+        results = self.subagent_executor(queries)
+        return self._ok(results=results, count=len(results))
 
     def execute(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         fn = self._executors.get(name)

@@ -74,6 +74,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--sandbox", action="store_true",
                    help="Run commands in a network-less, read-only-root sandbox (bwrap/firejail).")
     p.add_argument("--env-allow", help="Extra env vars (comma-separated) to pass through to commands.")
+    p.add_argument("--no-subagents", action="store_true", help="Disable read-only subagents (parallel_search).")
+    p.add_argument("--subagent-parallel", type=int, help="Max concurrent subagents (default 4).")
+    p.add_argument("--no-stream", action="store_true", help="Disable live streaming of assistant text and command output.")
+    p.add_argument("--no-skills", action="store_true", help="Disable auto-loading of agent skills.")
+    p.add_argument("--max-skills", type=int, help="Max skills to inject per session (default 3).")
     p.add_argument("--compact", action="store_true",
                    help="Summarize oldest turns when context overflows (cache-friendly).")
     p.add_argument("--allow-outside-workdir", action="store_true",
@@ -98,6 +103,16 @@ def _cli_overrides(opts: argparse.Namespace) -> dict[str, Any]:
         value = getattr(opts, key, None)
         if value is not None:
             overrides[key] = value
+    if getattr(opts, "subagent_parallel", None) is not None:
+        overrides["subagent_parallel"] = opts.subagent_parallel
+    if getattr(opts, "max_skills", None) is not None:
+        overrides["max_skills"] = opts.max_skills
+    if getattr(opts, "no_subagents", False):
+        overrides["subagents"] = False
+    if getattr(opts, "no_stream", False):
+        overrides["stream"] = False
+    if getattr(opts, "no_skills", False):
+        overrides["skills"] = False
     for flag in ("allow_outside_workdir", "allow_dangerous_commands", "verbose", "compact", "quiet", "sandbox"):
         if getattr(opts, flag, False):
             overrides[flag] = True
@@ -122,6 +137,8 @@ def _build_agent(config: Any, workdir: str, history: list[dict[str, Any]] | None
         command_timeout=config.command_timeout,
         sandbox=config.sandbox,
         env_allow=config.env_allow,
+        stream=config.stream,
+        quiet=config.quiet,
     )
     return Agent(config, llm=llm, tools=tools, history=history)
 
@@ -151,7 +168,12 @@ def _run_task(config: Any, store: SessionStore, workdir: str, task: str, message
     store.snapshot_artifacts(sid, workdir)
     store.advance_head(sid)
 
-    print(answer)
+    if getattr(config, "stream", False):
+        # The answer was already streamed to stdout; just terminate the line.
+        if answer and not answer.endswith("\n"):
+            print()
+    else:
+        print(answer)
     if not getattr(config, "quiet", False):
         print(f"[session {sid}] on branch {store.current_branch() or '(detached)'}", file=sys.stderr)
     return 0
@@ -365,7 +387,11 @@ def _repl(opts: argparse.Namespace, config: Any, store: SessionStore, workdir: s
         except AgentError as exc:
             print(f"error: {exc}", file=sys.stderr)
             continue
-        print(answer)
+        if getattr(config, "stream", False):
+            if answer and not answer.endswith("\n"):
+                print()
+        else:
+            print(answer)
 
     # Seal the whole REPL interaction as ONE session (multi-turn, single commit).
     if len(agent.messages) > initial_len:
